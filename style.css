@@ -1,0 +1,281 @@
+/* Base styles */
+body {
+  background: black;
+  color: #f4f8f4;
+  font-family: 'Courier New', Courier, monospace;
+  font-size: 16px;
+  line-height: 1.4;
+  margin: 0;
+  padding: 20px;
+  user-select: none;
+  overflow-x: hidden;
+}
+
+/* Container with brutalist block - centered */
+.container {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 10px 20px;
+  border: 3px solid #00ff00;
+  background: #050805;
+  box-shadow:
+    0 0 5px #00ff00,
+    inset 0 0 10px #004400;
+  text-align: left;
+}
+
+/* Limit max width to about 80 characters for all blocks except pre/code and center them */
+body, p, h1, h2, h3, div, section, article {
+  max-width: 80ch;
+  margin-left: auto;
+  margin-right: auto;
+  white-space: normal;
+}
+
+/* Block code blocks */
+pre {
+  max-width: none;
+  background: #001100;
+  color: #e9ede9;
+  padding: 0.75em 1em;
+  border: 1px solid #007700;
+  font-family: monospace;
+  font-size: 14px;
+  overflow-x: auto;
+  border-radius: 4px;
+  box-shadow: none;
+  margin: 1em 0;
+  white-space: pre;
+}
+
+/* <code> inside <pre> - inherit pre formatting, remove inline styles */
+pre > code {
+  display: block;
+  white-space: inherit;
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  background: transparent;
+  border: none;
+  padding: 0;
+  margin: 0;
+  box-shadow: none;
+}
+
+/* Inline code */
+code:not(pre > code) {
+  background: #001100;
+  color: #00ff00;
+  padding: 0.1em 0.3em;
+  font-family: monospace;
+  font-size: 0.95em;
+  border-radius: 3px;
+  border: 1px solid #007700;
+  white-space: normal;
+  box-shadow: none;
+  display: inline;
+  vertical-align: baseline;
+  line-height: 1.2;
+}
+
+/* Heading style - glitchy text effect */
+h1, h2, h3 {
+  font-weight: bold;
+  color: #00ff00;
+  position: relative;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  margin-bottom: 1rem;
+  animation: glitch 1s infinite, rainbow-text 4s linear infinite;
+  background: linear-gradient(90deg, red, orange, yellow, lime, cyan, blue, magenta, red);
+  background-size: 200% auto;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  text-shadow:
+    0 0 5px #0f0,
+    0 0 10px #0ff,
+    0 0 15px #f0f;
+}
+
+/* Links styled like terminal commands */
+a {
+  color: #00ff00;
+  text-decoration: none;
+  border-bottom: 1px dashed #00ff00;
+  transition: all 0.3s ease;
+}
+a:hover, a:focus {
+  color: #ff0000;
+  border-bottom: 1px solid #ff0000;
+  text-shadow: 0 0 10px #ff0000;
+}
+
+/* Paragraph style - old terminal text */
+p {
+  font-size: 14px;
+  color: #f4f8f4;
+  margin-bottom: 1rem;
+  white-space: pre-wrap;
+  text-shadow:
+    0 0 2px #00ff00,
+    0 0 4px #00ff00;
+}
+
+/* Buttons with brutalist style */
+button {
+  background: black;
+  color: #00ff00;
+  border: 2px solid #00ff00;
+  padding: 10px 15px;
+  font-family: monospace;
+  font-weight: bold;
+  cursor: pointer;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  box-shadow: 0 0 5px #00ff00, 0 0 15px #00ff00;
+  transition: all 0.2s ease;
+}
+button:hover {
+  background: #00ff00;
+  color: black;
+  box-shadow: 0 0 10px #ff0000;
+}
+
+/* Scrollbar styled like terminal */
+::-webkit-scrollbar {
+  width: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #050805;
+}
+::-webkit-scrollbar-thumb {
+  background: #00ff00;
+  border-radius: 4px;
+}
+
+/* Optional: simulate CRT scanlines */
+.scanlines {
+  pointer-events: none;
+  position: fixed;
+  top: 0; left: 0; width: 100%; height: 100%;
+  background: repeating-linear-gradient(
+    rgba(0,255,0,0.05) 0px, 
+    rgba(0,255,0,0.05) 1px, 
+    transparent 1px, 
+    transparent 3px
+  );
+  mix-blend-mode: overlay;
+  z-index: 9999;
+}
+
+/* ASCII art style text */
+.ascii-art {
+  font-family: monospace;
+  white-space: pre;
+  letter-spacing: 0.1em;
+  color: #00ff00;
+  text-shadow:
+    0 0 2px #00ff00,
+    0 0 6px #00ff00;
+}
+
+/* Brutalist boxes */
+.box {
+  border: 2px solid #ff0000;
+  padding: 10px;
+  margin: 15px 0;
+  background: #100000;
+  color: #ff0000;
+  font-weight: bold;
+  text-transform: uppercase;
+  font-family: monospace;
+  box-shadow: 0 0 10px #ff0000 inset;
+  text-shadow: 0 0 5px #ff0000;
+}
+
+/* Scrolling banner */
+.scrolling-banner {
+  width: 100%;
+  background: black;
+  border-bottom: 3px solid #00ff00;
+  overflow: hidden;
+  white-space: nowrap;
+  box-shadow:
+    0 0 10px #00ff00,
+    inset 0 -5px 15px #004400;
+  text-align: center;
+  padding: 10px 0;
+  margin-bottom: 1em;
+  position: relative;
+}
+
+.scrolling-banner .text {
+  display: inline-block;
+  white-space: nowrap;
+  font-family: 'Courier New', Courier, monospace;
+  font-weight: bold;
+  font-size: 1.5rem;
+  letter-spacing: 0.3em;
+  text-transform: uppercase;
+  animation:
+    scroll-left 10s linear infinite,
+    glitch 1.5s infinite,
+    rainbow-text 4s linear infinite;
+  background: linear-gradient(90deg, red, orange, yellow, lime, cyan, blue, magenta, red);
+  background-size: 200% auto;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  text-shadow:
+    0 0 10px #ff0,
+    1px 0 5px #0ff,
+    -1px 0 5px #f0f;
+  transform: translateX(100%);
+}
+
+/* Glitch animation */
+@keyframes glitch {
+  0% {
+    text-shadow:
+      2px 0 red,
+      -2px 0 cyan,
+      0 0 10px #00ff00;
+  }
+  20% {
+    text-shadow:
+      -2px 0 red,
+      2px 0 cyan,
+      0 0 10px #00ff00;
+  }
+  40% {
+    text-shadow:
+      2px 0 cyan,
+      -2px 0 red,
+      0 0 10px #00ff00;
+  }
+  60% {
+    text-shadow:
+      -2px 0 cyan,
+      2px 0 red,
+      0 0 10px #00ff00;
+  }
+  80%, 100% {
+    text-shadow:
+      0 0 15px #00ff00;
+  }
+}
+
+/* Scroll animation */
+@keyframes scroll-left {
+  0% {
+    transform: translateX(100%);
+  }
+  100% {
+    transform: translateX(-100%);
+  }
+}
+
+/* Rainbow gradient animation */
+@keyframes rainbow-text {
+  0% {
+    background-position: 0% center;
+  }

