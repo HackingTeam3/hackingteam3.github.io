@@ -2,7 +2,7 @@
 <a href="2025-charx-wape.html">[wape]</a>
 <link rel="stylesheet" href="style.css">
 <h2 id="brief">Brief</h2>
-<p>A vulnerability was introduced in the 1.71 releaee of Phoenix
+<p>A vulnerability was introduced in the 1.71 release of Phoenix
 Contact CHARX firmware.</p>
 <p>The vulnerability allows for command injection due to missing
 authentication, leading to code execution as root.</p>
@@ -65,7 +65,7 @@ on the <code>ip_to</code> field, we can inject a command into this field
 and get it to execute when <code>dhcpd</code> parses the configuration
 file.</p>
 <h2 id="execution">Execution</h2>
-<p>Unfortunatel it's hard to induce this behaviour, so we instead rely
+<p>Unfortunately it's hard to induce this behaviour, so we instead rely
 on another unauthenticated endpoint
  <code>api/v1.0/reboot</code> in
 <code>api_reboot.so</code> to reboot the device, which triggers the
