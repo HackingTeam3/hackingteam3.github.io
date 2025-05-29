@@ -2,8 +2,8 @@
 <a href="2025-charx-wape.html">[wape]</a>
 <link rel="stylesheet" href="style.css">
 <h2 id="brief">Brief</h2>
-<p>A vulnerability was introduced in the most recent version of Phoenix
-Contact’s firmware for the CHARX series.</p>
+<p>A vulnerability was introduced in the 1.71 releaee of Phoenix
+Contact CHARX firmware.</p>
 <p>The vulnerability allows for command injection due to missing
 authentication, leading to code execution as root.</p>
 <h2 id="details">Details</h2>
@@ -65,13 +65,14 @@ on the <code>ip_to</code> field, we can inject a command into this field
 and get it to execute when <code>dhcpd</code> parses the configuration
 file.</p>
 <h2 id="execution">Execution</h2>
-<p>Unfortunately, its hard to entice this behaviour, so we instead rely
-on another unauthenticated endpoint, <code>api/v1.0/reboot</code> in
-<code>api_reboot.so</code>, to reboot the device which triggers the
+<p>Unfortunatel it's hard to induce this behaviour, so we instead rely
+on another unauthenticated endpoint
+ <code>api/v1.0/reboot</code> in
+<code>api_reboot.so</code> to reboot the device, which triggers the
 parsing and execution of the command.</p>
 <p>This script only runs when the device is in client mode, and for the
-contest we need to exploit a server mode device. to resolve this, we use
-some behaviour of the device, DHCP bind scripts, to induce a switch.</p>
+contest we need to exploit a server mode device. To resolve this, we use
+device DHCP bind scripts to trigger a switch.</p>
 <p>By advertising an IP address on the 192.168.4.0/24 range, we can get
 the device to reboot to client mode.</p>
 <p>In <code>/etc/udhcpc.d/60systemreconfigure</code>:</p>
