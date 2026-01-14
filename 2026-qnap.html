@@ -1,0 +1,241 @@
+<link rel="stylesheet" href="style.css">
+<h1 id="the-20-lpe">The $20 LPE</h1>
+<p>Multiple issues with QNAP macOS tooling were identified when setting up an environment for Pwn2Own Ireland research. The vulnerabilities can be used for local privilege escalation via an insecure Privileged Helper Tool.</p>
+<p>Despite some similar reports receiving reasonable bounties under QNAP&#39;s program, these bugs were assigned a total of $20, later followed by $310. While these bugs are incredibly easy to exploit and took very little time to find, such a low reward was puzzling - especially when we are aware of much higher rewards given for colliding reports.</p>
+<p>This blog post provides a working LPE for every version of <code>qsoftwareupdater</code> from 1.0.0 to 1.0.4. Much of the thinking here can be applied to the new version, 1.0.5, if you want to spend time hitting race windows for the price of a Big Mac.</p>
+<h2 id="qnap-on-macos">QNAP on macOS</h2>
+<p>QNAP provides various macOS applications for their range of appliances, but this blog post will talk about <code>qsoftwareupdater</code>, the Privileged Helper Tool (PHT) used for QVPN, QFinder Pro and QSync.</p>
+<p>Privileged Helper Tools are daemons launched by <code>launchd</code> to perform privileged activities on behalf of standard user applications. They are usually contacted using macOS APIs, where the PHT is meant to verify the source of the request and, if valid, perform an action.</p>
+<p>This logic is in an implementation of  <code>-[NSXPCListenerDelegate listener:shouldAcceptNewConnection:]</code> and usually involves requesting code-signing data to verify that the client is signed by the correct developer and, ultimately, the Apple Root CA.</p>
+<p>QNAP decided to use an altogether different approach: an unauthenticated HTTP server! Any process can connect to <code>qsoftwareupdater</code> and is able to send it one of four requests:</p>
+<ul>
+<li><code>/QSoftwareUpdater/Open</code> - call <code>open</code> on a file</li>
+<li><code>/QSoftwareUpdater/UpdatePKG</code> - Install a update PKG file</li>
+<li><code>/QSoftwareUpdater/Test</code> - Check the PHT is running</li>
+<li><code>/QSoftwareUpdater/Version</code> - Get the PHT version</li>
+</ul>
+<p>The main attack surface here is the <code>UpdatePKG</code> route, which accepts two parameters, a DMG and the name of a package that is meant to be in it. The request is passed in the form of a query string such as:</p>
+<pre><code>?path=<span class="hljs-variable">%2ftmp%</span>2fQclient.dmg&amp;pkgName=Qclient HTTP/1.1<span class="hljs-symbol">\r</span><span class="hljs-symbol">\n</span>Host: 127.0.0.1<span class="hljs-symbol">\r</span><span class="hljs-symbol">\n</span><span class="hljs-symbol">\r</span><span class="hljs-symbol">\n</span>
+</code></pre><p>Sample Request to <code>UpdatePKG</code> Endpoint</p>
+<p>In the aforementioned example request, the <code>path</code> parameter (<code>/tmp/Qclient.dmg</code>) is a valid DMG file containing a  package <code>Qclient.pkg</code>.</p>
+<p>The <code>UpdatePKG</code> handler is <code>+[SoftwareUpdateHelper installDMG:targetVolume:withReply:]</code></p>
+<h2 id="exploitation-v1-0-0-">Exploitation (v1.0.0)</h2>
+<p>The first version performed the update in the following stages:</p>
+<ol>
+<li>Mounted the disk</li>
+<li>Verify the target package with <code>pkgutil --check-signature</code></li>
+<li>Copy the package out of the DMG to the DMG directory with <code>cp</code></li>
+<li>Install it with <code>installer</code></li>
+</ol>
+<p>After mounting, the package is checked with <code>pkgutil</code>:</p>
+<pre><code>// Check signature of package
+v83[0] = (__int64)CFSTR("--check-signature");
+v66 = objc_retainAutoreleasedReturnValue(v25);
+v83[1] = (__int64)v66;
+v26 = +[<span class="hljs-string">NSArray arrayWithObjects:count:</span>](<span class="hljs-link">&amp;OBJC_CLASS___NSArray, "arrayWithObjects:count:", v83, 2LL</span>);
+v27 = objc_retainAutoreleasedReturnValue(v26);
+objc_release(v22);
+v28 = objc<span class="hljs-emphasis">_alloc_</span>init(&amp;OBJC<span class="hljs-emphasis">_CLASS_</span>__NSTask);  
+v29 = +[<span class="hljs-string">NSPipe pipe</span>](<span class="hljs-link">&amp;OBJC_CLASS___NSPipe, "pipe"</span>);
+v30 = objc_retainAutoreleasedReturnValue(v29);
+-[<span class="hljs-string">NSTask setStandardOutput:</span>](<span class="hljs-link">v28, "setStandardOutput:", v30</span>);
+v31 = +[<span class="hljs-string">NSURL fileURLWithPath:</span>](<span class="hljs-link">&amp;OBJC_CLASS___NSURL, "fileURLWithPath:", CFSTR("/usr/sbin/pkgutil"</span>));
+v32 = objc_retainAutoreleasedReturnValue(v31);
+objc_release(v75);
+v76 = v32;
+-[<span class="hljs-string">NSTask setExecutableURL:</span>](<span class="hljs-link">v28, "setExecutableURL:", v32</span>);
+v78 = v27;
+-[<span class="hljs-string">NSTask setArguments:</span>](<span class="hljs-link">v28, "setArguments:", v27</span>);
+-[<span class="hljs-string">NSTask launch</span>](<span class="hljs-link">v28, "launch"</span>);
+...
+v38 = -[<span class="hljs-string">NSString initWithData:encoding:</span>](<span class="hljs-link">v37, "initWithData:encoding:", v36, 4LL</span>);
+NSLog((NSString *)CFSTR("output: %@"), v38);
+if ( -[NSString containsString:](
+<span class="hljs-code">        v38,</span>
+<span class="hljs-code">        "containsString:",</span>
+<span class="hljs-code">        CFSTR("Developer ID Installer: QNAP Systems, Inc. (JY5JM7GXQJ)")) )</span>
+<span class="hljs-code">        ...</span>
+}
+</code></pre><p>If this check passes, <code>cp</code> is called to copy the package out of the mounted DMG to the directory containing the DMG:</p>
+<pre><code>// Copying the package out of the DMG
+v42 = +[<span class="hljs-string">NSURL fileURLWithPath:</span>](<span class="hljs-link">&amp;OBJC_CLASS___NSURL, "fileURLWithPath:", CFSTR("/bin/cp"</span>));
+v61 = v34;
+v71 = objc_retainAutoreleasedReturnValue(v42);
+objc_release(v76);
+-[<span class="hljs-string">NSTask setExecutableURL:</span>](<span class="hljs-link">v69, "setExecutableURL:", v71</span>);
+v43 = v41;
+-[<span class="hljs-string">NSTask setArguments:</span>](<span class="hljs-link">v69, "setArguments:", v41</span>);
+-[<span class="hljs-string">NSTask launch</span>](<span class="hljs-link">v69, "launch"</span>);
+...
+v48 = objc_msgSend(v68, "stringByAppendingFormat:", CFSTR("/%@"), v74);
+v72 = objc_retainAutoreleasedReturnValue(v48);
+</code></pre><p>Finally, <code>installer</code> is called to install the package:</p>
+<pre><code>// Build args for installer
+v80[0] = CFSTR("-pkg");
+v80[1] = v72;
+v80[2] = CFSTR("-target");
+v80[3] = v65;
+v80[4] = CFSTR("-dumplog");
+v49 = +[<span class="hljs-string">NSArray arrayWithObjects:count:</span>](<span class="hljs-link">&amp;OBJC_CLASS___NSArray, "arrayWithObjects:count:", v80, 5LL</span>);
+v50 = objc_retainAutoreleasedReturnValue(v49);
+objc_release(v46);
+v51 = objc<span class="hljs-emphasis">_alloc_</span>init(&amp;OBJC<span class="hljs-emphasis">_CLASS_</span>__NSTask);
+v52 = +[<span class="hljs-string">NSURL fileURLWithPath:</span>](<span class="hljs-link">&amp;OBJC_CLASS___NSURL, "fileURLWithPath:", CFSTR("/usr/sbin/installer"</span>));
+v53 = objc_retainAutoreleasedReturnValue(v52);
+...
+-[<span class="hljs-string">NSTask setExecutableURL:</span>](<span class="hljs-link">v51, "setExecutableURL:", v53</span>);
+-[<span class="hljs-string">NSTask setArguments:</span>](<span class="hljs-link">v51, "setArguments:", v50</span>);
+-[<span class="hljs-string">NSTask launch</span>](<span class="hljs-link">v51, "launch"</span>);
+</code></pre><p>As the exit code of <code>cp</code> is discarded, the copy of the package can fail, whereupon the PHT attempts to install any package that matches the expected path.</p>
+<p>This means that the following DMG structure can completely circumvent the <code>pkgutil</code> check</p>
+<pre><code>Outer<span class="hljs-selector-class">.dmg</span> (RO-mounted)
+----&gt; Payload<span class="hljs-selector-class">.pkg</span> (unsigned)
+----&gt; Inner<span class="hljs-selector-class">.dmg</span>
+  -----&gt; Payload<span class="hljs-selector-class">.pkg</span> (QNAP-signed package)
+</code></pre><p>With <code>Outer.dmg</code> mounted read-only and a request sent to install <code>Payload.pkg</code> in <code>Inner.dmg</code>, the <code>Payload.pkg</code> in <code>Outer.dmg</code> is installed instead.</p>
+<p>But carrying an entire legit package is a pain, so it&#39;s time to break code-signing entirely</p>
+<h2 id="exploitation-v1-0-2-">Exploitation (v1.0.2)</h2>
+<p>The 1.0.2 release fixes this issue by removing the <code>cp</code> call, however more issues were soon identified.</p>
+<p>When verifying the package, the result of <code>pkgutil</code> is checked to contain strings indicating that the package is signed by QNAP, however the output of the command contains user-controllable data.</p>
+<p>The initial check just checked for the presence of QNAP&#39;s developer ID:</p>
+<pre><code>v31 = +[<span class="hljs-string">NSURL fileURLWithPath:</span>](<span class="hljs-link">&amp;OBJC_CLASS___NSURL, "fileURLWithPath:", CFSTR("/usr/sbin/pkgutil"</span>));
+v32 = objc_retainAutoreleasedReturnValue(v31);
+objc_release(v75);
+v76 = v32;
+-[<span class="hljs-string">NSTask setExecutableURL:</span>](<span class="hljs-link">v28, "setExecutableURL:", v32</span>);
+v78 = v27;
+-[<span class="hljs-string">NSTask setArguments:</span>](<span class="hljs-link">v28, "setArguments:", v27</span>);
+-[<span class="hljs-string">NSTask launch</span>](<span class="hljs-link">v28, "launch"</span>);
+v59 = v30;
+v33 = -[<span class="hljs-string">NSPipe fileHandleForReading</span>](<span class="hljs-link">v30, "fileHandleForReading"</span>);
+v34 = objc_retainAutoreleasedReturnValue(v33);
+v35 = -[<span class="hljs-string">NSFileHandle readDataToEndOfFile</span>](<span class="hljs-link">v34, "readDataToEndOfFile"</span>);
+v36 = objc_retainAutoreleasedReturnValue(v35);
+v37 = objc<span class="hljs-emphasis">_alloc(&amp;OBJC_</span>CLASS<span class="hljs-emphasis">___</span>NSString);
+v60 = v36;
+v38 = -[<span class="hljs-string">NSString initWithData:encoding:</span>](<span class="hljs-link">v37, "initWithData:encoding:", v36, 4LL</span>);
+NSLog((NSString *)CFSTR("output: %@"), v38);
+
+// Check the signature
+if ( (unsigned <span class="hljs-emphasis">__int8)objc_</span>msgSend(
+<span class="hljs-code">                        v38,</span>
+<span class="hljs-code">                        "containsString:",</span>
+<span class="hljs-code">                        CFSTR("Developer ID Installer: QNAP Systems, Inc. (JY5JM7GXQJ)")) )</span>
+{
+  NSLog((NSString *)CFSTR("checkSignatureTask pass"));
+  // installation continues
+  ...
+}
+</code></pre><p>By generating a certificate with <code>Developer ID Installer: QNAP Systems, Inc. (JY5JM7GXQJ)</code> in the certificate name and then signing a package with this certificate, it is possible to pass this check. It should be noted that macOS will not install a self-signed package by default, preventing this from being an issue in isolation.</p>
+<p>Luckily, there&#39;s also a sufficiently large window between <code>pkgutil</code> and <code>installer</code> such that an attacker can redirect a symlink to an <em>unsigned</em> package, something that macOS will install without issue.</p>
+<p>Therefore, to escalate using v1.0.2 we:</p>
+<ol>
+<li>Make a symlink to a package signed with our certificate</li>
+<li>Make the request</li>
+<li>Redirect the symlink</li>
+<li>Execution!</li>
+</ol>
+<p>It&#39;s important to note that the package verification issue hasn&#39;t actually been fixed, but that QNAP&#39;s response has made the race window even larger. The new check searches more strings in the same user-controllable output, making the gap between <code>pkgutil</code> and <code>installer</code> larger than it was before:</p>
+<pre><code>if ( -[NSString containsString:](
+<span class="hljs-code">        v52,</span>
+<span class="hljs-code">        "containsString:",</span>
+<span class="hljs-code">        CFSTR("Status: signed by a developer certificate issued by Apple for distribution"))</span>
+  &amp;&amp; -[<span class="hljs-string">NSString containsString:</span>](<span class="hljs-link">v52, "containsString:", CFSTR("Notarization: trusted by the Apple notary service"</span>))
+  &amp;&amp; -[NSString containsString:](
+<span class="hljs-code">        v52,</span>
+<span class="hljs-code">        "containsString:",</span>
+<span class="hljs-code">        CFSTR("Developer ID Installer: QNAP Systems, Inc. (JY5JM7GXQJ)"))</span>
+  &amp;&amp; -[<span class="hljs-string">NSString containsString:</span>](<span class="hljs-link">v52, "containsString:", CFSTR("Developer ID Certification Authority"</span>))
+  &amp;&amp; -[<span class="hljs-string">NSString containsString:</span>](<span class="hljs-link">v52, "containsString:", CFSTR("Apple Root CA"</span>)) )
+{
+  NSLog((NSString *)CFSTR("checkSignatureTask pass"));
+  ...
+}
+</code></pre><h2 id="exploitation-v1-0-4-">Exploitation (v1.0.4)</h2>
+<p>Bypassing the verification with a fake-signed package makes exploitation simpler and reduces the size of exploit resources. But what if we can remove the need for a DMG entirely?</p>
+<p>The PHT will assume that the name of a DMG is also the Volume Name, and perform a precautionary forced unmount prior to attaching the requested DMG:</p>
+<pre><code>v7 = objc_retain(installDMG);
+v8 = objc_msgSend(v7, "lastPathComponent");
+v9 = objc_retainAutoreleasedReturnValue(v8);
+v10 = objc_msgSend(v9, "stringByDeletingPathExtension");
+v11 = objc_retainAutoreleasedReturnValue(v10);
+objc_release(v9);
+v57 = v11;
+v12 = +[<span class="hljs-string">NSString stringWithFormat:</span>](<span class="hljs-link">&amp;OBJC_CLASS___NSString, "stringWithFormat:", CFSTR("/Volumes/%@"</span>), v11);s
+v70 = objc_retainAutoreleasedReturnValue(v12);
+v85[0] = (__int64)CFSTR("unmount");
+v85[1] = (__int64)v70;
+v13 = +[<span class="hljs-string">NSArray arrayWithObjects:count:</span>](<span class="hljs-link">&amp;OBJC_CLASS___NSArray, "arrayWithObjects:count:", v85, 2LL</span>);
+v14 = objc_retainAutoreleasedReturnValue(v13);
+v15 = objc<span class="hljs-emphasis">_alloc_</span>init(&amp;OBJC<span class="hljs-emphasis">_CLASS_</span>__NSTask);
+v16 = +[<span class="hljs-string">NSURL fileURLWithPath:</span>](<span class="hljs-link">&amp;OBJC_CLASS___NSURL, "fileURLWithPath:", CFSTR("/usr/bin/hdiutil"</span>));
+v78 = objc_retainAutoreleasedReturnValue(v16);
+-[<span class="hljs-string">NSTask setExecutableURL:</span>](<span class="hljs-link">v15, "setExecutableURL:", v78</span>);
+-[<span class="hljs-string">NSTask setArguments:</span>](<span class="hljs-link">v15, "setArguments:", v14</span>);
+-[<span class="hljs-string">NSTask launch</span>](<span class="hljs-link">v15, "launch"</span>);
+</code></pre><p>In a pattern reminiscent of the missing <code>cp</code> check, the unmount and subsequent attach calls never have their return code checked. This is somewhat understandable in the unmount case, but not so much with attach. The consequence of this is that, provided the path built by the PHT is valid, disk operations can fail entirely but the function can still successfully complete.</p>
+<pre><code>NSLog((NSString *)CFSTR(<span class="hljs-string">"[installPKG] enter"</span>), a2);
+
+// Get filename from path<span class="hljs-built_in"> and </span>strip extension
+
+v8 = objc_msgSend(v7, <span class="hljs-string">"lastPathComponent"</span>);
+v9 = objc_retainAutoreleasedReturnValue(v8);
+v10 = objc_msgSend(v9, <span class="hljs-string">"stringByDeletingPathExtension"</span>);
+v11 = objc_retainAutoreleasedReturnValue(v10);
+objc_release(v9);
+v57 = v11;
+
+// Build the expected DMG mount point
+
+v12 = +[NSString stringWithFormat:](&amp;OBJC_CLASS___NSString, <span class="hljs-string">"stringWithFormat:"</span>, CFSTR(<span class="hljs-string">"/Volumes/%@"</span>), v11);
+v70 = objc_retainAutoreleasedReturnValue(v12);
+<span class="hljs-keyword">.</span>..
+
+// Get contents of mount point
+v26 = -[NSFileManager contentsOfDirectoryAtPath:error:](v59, <span class="hljs-string">"contentsOfDirectoryAtPath:error:"</span>, v70, 0<span class="hljs-class">LL);</span>
+v27 = objc_retainAutoreleasedReturnValue(v26);
+v28 = ((NSArray *(*)(id, SEL, id, ...))objc_msgSend)(&amp;OBJC_CLASS___NSArray, <span class="hljs-string">"arrayWithObjects:"</span>, CFSTR(<span class="hljs-string">"pkg"</span>), 0<span class="hljs-class">LL);</span>
+v61 = objc_retainAutoreleasedReturnValue(v28);
+
+// Query the results with an NSPredicate
+v29 = ((NSPredicate *(*)(id, SEL, NSString *, ...))objc_msgSend)(
+        &amp;OBJC_CLASS___NSPredicate,
+        <span class="hljs-string">"predicateWithFormat:"</span>,
+        &amp;CFSTR(<span class="hljs-string">"(pathExtension IN %@)"</span>).isa,
+        v61);
+v30 = objc_retainAutoreleasedReturnValue(v29);
+v60 = v27;
+
+// Filter out other files
+v31 = -[NSArray filteredArrayUsingPredicate:](v27, <span class="hljs-string">"filteredArrayUsingPredicate:"</span>, v30);
+v32 = objc_retainAutoreleasedReturnValue(v31);
+objc_release(v30);
+v62 = v32;<span class="hljs-built_in">
+if </span>( !v32 )
+ <span class="hljs-built_in"> goto </span><span class="hljs-class">LABEL_5;</span>
+v25 = 0<span class="hljs-class">LL;</span>
+
+// Get the first filtered result<span class="hljs-built_in"> and </span>confirm the name names the value passed in pkgName
+v33 = -[NSArray objectAtIndex:](v32, <span class="hljs-string">"objectAtIndex:"</span>, 0<span class="hljs-class">LL);</span>
+v34 = objc_retainAutoreleasedReturnValue(v33);<span class="hljs-built_in">
+if </span>( !v34 )
+ <span class="hljs-built_in"> goto </span><span class="hljs-class">LABEL_5;</span>
+v35 = v34;<span class="hljs-built_in">
+if </span>( (unsigned __int8)objc_msgSend(v34, <span class="hljs-string">"isEqualToString:"</span>, &amp;stru_100005488) ) // <span class="hljs-string">"pkgName"</span>
+
+  // continue
+}
+</code></pre><p>A cursory glance at this code paired with the disk operation quirks reveals that you can direct the PHT outside a (supposedly) mounted DMG. This can be achieved by requesting a path that would exist if the DMG mount failed - such as <code>/tmp/Payload.pkg</code> inside a DMG named <code>Macintosh HD.dmg</code>.</p>
+<p>Exploiting v1.0.4 is therefore possible by sending a request to install a package in this DMG, which causes the PHT to perform the following sequence of events:</p>
+<ol>
+<li>Convert <code>/tmp/Macintosh HD.dmg</code> to <code>Macintosh HD</code></li>
+<li>Attempt to unmount <code>/Volumes/Macintosh HD</code> (this fails)</li>
+<li>Attempts to attach <code>/tmp/Macintosh HD.dmg</code></li>
+<li>Build a path using <code>/Volumes</code>, <code>Macintosh HD</code>, and the supplied package name to call <code>pkgutil -—check-signature</code> on <code>/Volumes/Macintosh HD/tmp/Qclient.pkg</code> (a writeable location where we&#39;ve dropped a legitimate or fake-signed package)</li>
+</ol>
+<p>Finally, reuse the old TOCTTOU bug from the v1.0.2 technique to redirect the link from a fake-signed package to your unsigned payload.</p>
+<p>Because we never mount the DMG we don&#39;t need it to be a real image, so can use a renamed bash script instead. We&#39;ve successfully removed all additional resources from the privesc.</p>
+<h2 id="exploitation-v1-0-5-">Exploitation (v1.0.5)</h2>
+<p>Yeah I'm not doing this again for $330, but <a href="https://www.qnap.com/en-uk/utilities/essentials#utliity_3">feel free, dear reader.</a> </p>
+<h2 id="exploit-code">Exploit code</h2>
+<p>Working exploits for the second and third exploits can be found <a href="https://github.com/HackingTeam3/qnap-lpe">here</a>. Fake certificates have not been provided.</p>
